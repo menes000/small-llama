@@ -104,3 +104,40 @@ LLAMA_API float * llama_get_embeddings_pre_norm    (struct llama_context * ctx);
 
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_pre_norm_ith(struct llama_context * ctx, int32_t i);
+
+// Fill the shared K/V consumed by the Gemma 4 Assistant draft graph.
+// Host copies of the target model's last full-attention + last sliding-attention layer
+// K/V (post k_norm + rope), each laid out as [head_dim, n_head_kv, n_kv].
+LLAMA_API void llama_set_assistant_shared_kv(
+        struct llama_context * ctx,
+        int64_t n_head_kv,
+        int64_t head_dim_full, const float * k_full, const float * v_full, int64_t n_kv_full,
+        int64_t head_dim_swa,  const float * k_swa,  const float * v_swa,  int64_t n_kv_swa);
+
+// Copy the (dequantized) token embedding row for `token` from the model's token-embedding
+// table into out (must hold n_embd floats). Returns n_embd (0 on failure).
+LLAMA_API int32_t llama_model_get_token_embd(const struct llama_model * model, llama_token token, float * out);
+
+// Copy the model's final output_norm weight into out (must hold n_embd floats). Returns n_embd.
+LLAMA_API int32_t llama_model_get_output_norm(const struct llama_model * model, float * out);
+
+// Copy the `mtp.token_ordering` i32 buffer (ordered position -> canonical token id) into out
+// (must hold n_vocab ints). Returns count (0 if the model has no such tensor).
+LLAMA_API int32_t llama_model_get_token_ordering(const struct llama_model * model, int32_t * out);
+
+// Centroid (masked-embedding) head params: writes n_centroids and top_k (either may be null).
+// Returns n_centroids (0 if the model has no centroid head).
+LLAMA_API int32_t llama_model_get_centroid_params(const struct llama_model * model, int32_t * n_centroids, int32_t * top_k);
+
+// Target side: enable tapping the last full/swa has_kv layer K/V during decode.
+LLAMA_API void llama_set_assistant_kv_tap(struct llama_context * ctx, bool value);
+
+// Target side: fetch the most recent K/V tap. Sets the 4 pointers (any may be null) to
+// internal buffers laid out [head_dim, n_head_kv, n_tokens]; returns n_tokens.
+// Out dims (any may be null): n_head_kv, head_dim_full, head_dim_swa.
+LLAMA_API int64_t llama_get_assistant_kv_tap(
+        struct llama_context * ctx,
+        const float ** k_full, const float ** v_full,
+        const float ** k_swa,  const float ** v_swa,
+        const float ** hidden,
+        int64_t * n_head_kv, int64_t * head_dim_full, int64_t * head_dim_swa);

@@ -66,6 +66,7 @@ llama_context::llama_context(
     cparams.yarn_beta_slow   = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
     cparams.embeddings       = params.embeddings;
     cparams.embeddings_pre_norm = false;
+    cparams.assistant_kv_tap = false;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
@@ -1116,6 +1117,54 @@ void llama_context::set_causal_attn(bool value) {
     sched_need_reserve = true;
 }
 
+void llama_context::set_assistant_shared_kv(
+        int64_t n_head_kv,
+        int64_t head_dim_full, const float * k_full, const float * v_full, int64_t n_kv_full,
+        int64_t head_dim_swa,  const float * k_swa,  const float * v_swa,  int64_t n_kv_swa) {
+    assistant_kv.n_head_kv     = n_head_kv;
+    assistant_kv.head_dim_full = head_dim_full;
+    assistant_kv.head_dim_swa  = head_dim_swa;
+    assistant_kv.n_kv_full     = n_kv_full;
+    assistant_kv.n_kv_swa      = n_kv_swa;
+
+    const size_t n_full = (size_t) head_dim_full * n_head_kv * n_kv_full;
+    const size_t n_sw   = (size_t) head_dim_swa  * n_head_kv * n_kv_swa;
+
+    assistant_kv.k_full.assign(k_full, k_full + n_full);
+    assistant_kv.v_full.assign(v_full, v_full + n_full);
+    assistant_kv.k_swa .assign(k_swa,  k_swa  + n_sw);
+    assistant_kv.v_swa .assign(v_swa,  v_swa  + n_sw);
+
+    // the draft graph bakes n_kv into its input tensor shapes, so it must be rebuilt
+    // whenever the shared K/V length changes
+    sched_need_reserve = true;
+}
+
+void llama_context::set_assistant_kv_tap(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+    if (cparams.assistant_kv_tap == value) {
+        return;
+    }
+    cparams.assistant_kv_tap = value;
+    sched_need_reserve = true; // graph must be rebuilt to emit (or drop) the tap tensors
+}
+
+int64_t llama_context::get_assistant_kv_tap(
+        const float ** k_full, const float ** v_full,
+        const float ** k_swa,  const float ** v_swa,
+        const float ** hidden,
+        int64_t * n_head_kv, int64_t * head_dim_full, int64_t * head_dim_swa) const {
+    if (k_full) { *k_full = kv_tap_k_full.data(); }
+    if (v_full) { *v_full = kv_tap_v_full.data(); }
+    if (k_swa)  { *k_swa  = kv_tap_k_swa.data();  }
+    if (v_swa)  { *v_swa  = kv_tap_v_swa.data();  }
+    if (hidden) { *hidden = kv_tap_hidden.data(); }
+    if (n_head_kv)     { *n_head_kv     = kv_tap_n_head_kv;     }
+    if (head_dim_full) { *head_dim_full = kv_tap_head_dim_full; }
+    if (head_dim_swa)  { *head_dim_swa  = kv_tap_head_dim_swa;  }
+    return kv_tap_n_tokens;
+}
+
 void llama_context::set_warmup(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1923,6 +1972,42 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
         }
 
+        // extract the Gemma 4 Assistant K/V tap (all tokens, appended across ubatches of this decode)
+        if (cparams.assistant_kv_tap) {
+            if (n_tokens_prev == 0) {
+                kv_tap_k_full.clear(); kv_tap_v_full.clear();
+                kv_tap_k_swa.clear();  kv_tap_v_swa.clear();
+                kv_tap_hidden.clear();
+                kv_tap_n_tokens = 0;
+            }
+            auto append_tap = [&](ggml_tensor * t, std::vector<float> & dst) {
+                if (t == nullptr) {
+                    return;
+                }
+                const size_t off = dst.size();
+                dst.resize(off + ggml_nelements(t));
+                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+                GGML_ASSERT(b != nullptr);
+                ggml_backend_tensor_get_async(b, t, dst.data() + off, 0, ggml_nbytes(t));
+            };
+
+            ggml_tensor * tk_full = res->get_kv_tap_k_full();
+            ggml_tensor * tv_full = res->get_kv_tap_v_full();
+            ggml_tensor * tk_swa  = res->get_kv_tap_k_swa();
+            ggml_tensor * tv_swa  = res->get_kv_tap_v_swa();
+
+            append_tap(tk_full, kv_tap_k_full);
+            append_tap(tv_full, kv_tap_v_full);
+            append_tap(tk_swa,  kv_tap_k_swa);
+            append_tap(tv_swa,  kv_tap_v_swa);
+            append_tap(res->get_kv_tap_hidden(), kv_tap_hidden);
+
+            kv_tap_n_tokens     += (int64_t) ubatch.n_tokens;
+            kv_tap_n_head_kv     = tk_full ? tk_full->ne[1] : (tk_swa ? tk_swa->ne[1] : 0);
+            kv_tap_head_dim_full = tk_full ? tk_full->ne[0] : 0;
+            kv_tap_head_dim_swa  = tk_swa  ? tk_swa->ne[0]  : 0;
+        }
+
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
@@ -2283,6 +2368,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.assistant_kv =*/ &assistant_kv,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3430,7 +3516,8 @@ llama_context * llama_init_from_model(
     }
 
     if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-        model->hparams.nextn_predict_layers == 0) {
+        model->hparams.nextn_predict_layers == 0 &&
+        model->arch != LLM_ARCH_GEMMA4_ASSISTANT) {
         LLAMA_LOG_WARN("%s: context type MTP requested but model doesn't contain MTP layers\n", __func__);
         return nullptr;
     }
@@ -3990,4 +4077,27 @@ void llama_opt_epoch(
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+void llama_set_assistant_shared_kv(
+        llama_context * ctx,
+        int64_t n_head_kv,
+        int64_t head_dim_full, const float * k_full, const float * v_full, int64_t n_kv_full,
+        int64_t head_dim_swa,  const float * k_swa,  const float * v_swa,  int64_t n_kv_swa) {
+    ctx->set_assistant_shared_kv(n_head_kv, head_dim_full, k_full, v_full, n_kv_full,
+                                 head_dim_swa, k_swa, v_swa, n_kv_swa);
+}
+
+void llama_set_assistant_kv_tap(llama_context * ctx, bool value) {
+    ctx->set_assistant_kv_tap(value);
+}
+
+int64_t llama_get_assistant_kv_tap(
+        llama_context * ctx,
+        const float ** k_full, const float ** v_full,
+        const float ** k_swa,  const float ** v_swa,
+        const float ** hidden,
+        int64_t * n_head_kv, int64_t * head_dim_full, int64_t * head_dim_swa) {
+    ctx->synchronize();
+    return ctx->get_assistant_kv_tap(k_full, v_full, k_swa, v_swa, hidden, n_head_kv, head_dim_full, head_dim_swa);
 }

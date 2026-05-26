@@ -172,6 +172,12 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         inp_per_layer = project_per_layer_inputs(inpL, inp_per_layer);
     }
 
+    // Gemma 4 Assistant KV tap: remember the last full/swa has_kv layer's K/V (post norm+rope)
+    ggml_tensor * kv_tap_k_full = nullptr;
+    ggml_tensor * kv_tap_v_full = nullptr;
+    ggml_tensor * kv_tap_k_swa  = nullptr;
+    ggml_tensor * kv_tap_v_swa  = nullptr;
+
     for (int il = 0; il < n_layer; ++il) {
         const int64_t n_embd_head = hparams.n_embd_head_k(il);
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_v(il));
@@ -234,6 +240,15 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
             cb(Kcur, "Kcur_pos", il);
 
+            // tap the K/V for the assistant draft (last has_kv layer of each type wins)
+            if (cparams.assistant_kv_tap) {
+                if (hparams.is_swa(il)) {
+                    kv_tap_k_swa = Kcur; kv_tap_v_swa = Vcur;
+                } else {
+                    kv_tap_k_full = Kcur; kv_tap_v_full = Vcur;
+                }
+            }
+
             cur = build_attn(inp_attn, model.layers[il].wo,
                     nullptr, model.layers[il].wo_s, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
                     hparams.f_attention_scale, il);
@@ -244,8 +259,10 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                     Qcur, nullptr, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
         }
 
-        // TODO @ngxson : strip unused token right after the last KV layer to speed up prompt processing
-        if (il == n_layer - 1 && inp_out_ids) {
+        // note: when the assistant K/V tap is active we must keep ALL tokens through the final
+        //       layer so the post-norm hidden tap covers every position (the prune is deferred
+        //       until just before lm_head below).
+        if (il == n_layer - 1 && inp_out_ids && !cparams.assistant_kv_tap) {
             cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
@@ -345,7 +362,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             ggml_tensor * inp_this_layer = ggml_view_2d_slice(ctx0, inp_per_layer, il); // [n_embd_per_layer, n_tokens]
 
             // TODO @ngxson : improve this
-            if (il == n_layer - 1 && inp_out_ids) {
+            if (il == n_layer - 1 && inp_out_ids && !cparams.assistant_kv_tap) {
                 inp_this_layer = ggml_get_rows(ctx0, inp_this_layer, inp_out_ids);
             }
 
@@ -372,12 +389,40 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     }
     cur = inpL;
 
+    if (cparams.assistant_kv_tap) {
+        res->t_kv_tap_k_full = kv_tap_k_full;
+        res->t_kv_tap_v_full = kv_tap_v_full;
+        res->t_kv_tap_k_swa  = kv_tap_k_swa;
+        res->t_kv_tap_v_swa  = kv_tap_v_swa;
+        // mark as graph outputs so the allocator gives them persistent, readable buffers;
+        // without this the scheduler reuses their memory and the host tap reads stale data
+        // (only the full-K happened to survive — V and SWA K/V came back garbage).
+        if (kv_tap_k_full) { ggml_set_output(kv_tap_k_full); ggml_build_forward_expand(gf, kv_tap_k_full); }
+        if (kv_tap_v_full) { ggml_set_output(kv_tap_v_full); ggml_build_forward_expand(gf, kv_tap_v_full); }
+        if (kv_tap_k_swa)  { ggml_set_output(kv_tap_k_swa);  ggml_build_forward_expand(gf, kv_tap_k_swa);  }
+        if (kv_tap_v_swa)  { ggml_set_output(kv_tap_v_swa);  ggml_build_forward_expand(gf, kv_tap_v_swa);  }
+    }
+
     cur = build_norm(cur,
             model.output_norm, nullptr,
             LLM_NORM_RMS, -1);
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
+
+    if (cparams.assistant_kv_tap) {
+        // post-norm hidden (== target last_hidden_state), all tokens — for the assistant concat.
+        // use a distinct intermediate node (not the t_embd graph output) so it has a readable buffer
+        res->t_kv_tap_hidden = ggml_scale(ctx0, cur, 1.0f);
+        ggml_set_output(res->t_kv_tap_hidden);
+        ggml_build_forward_expand(gf, res->t_kv_tap_hidden);
+
+        // the early prune was deferred so the hidden tap could see every token; apply it now
+        // so the lm_head (and t_logits) only cover the requested output positions.
+        if (inp_out_ids) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
+    }
 
     // lm_head
     cur = build_lora_mm(model.output, cur, model.output_s);

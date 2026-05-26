@@ -348,6 +348,43 @@ void llm_graph_input_cross_embd::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_assistant_kv::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    auto copy_kv = [](ggml_tensor * dst, const std::vector<float> & src) {
+        if (dst == nullptr) {
+            return;
+        }
+        assert(dst->type == GGML_TYPE_F32);
+        if (!src.empty()) {
+            assert((size_t) ggml_nelements(dst) == src.size());
+            ggml_backend_tensor_set(dst, src.data(), 0, ggml_nbytes(dst));
+        } else {
+            // no shared K/V supplied yet: zero-fill so the graph is well-defined
+            std::vector<float> zeros(ggml_nelements(dst), 0.0f);
+            ggml_backend_tensor_set(dst, zeros.data(), 0, ggml_nbytes(dst));
+        }
+    };
+
+    copy_kv(k_full, akv->k_full);
+    copy_kv(v_full, akv->v_full);
+    copy_kv(k_swa,  akv->k_swa);
+    copy_kv(v_swa,  akv->v_swa);
+
+    // attend-all masks (additive bias 0). Sliding-window restriction is applied by the
+    // caller via n_kv_swa (only the in-window target K/V are supplied).
+    auto zero_mask = [](ggml_tensor * dst) {
+        if (dst == nullptr) {
+            return;
+        }
+        std::vector<float> zeros(ggml_nelements(dst), 0.0f);
+        ggml_backend_tensor_set(dst, zeros.data(), 0, ggml_nbytes(dst));
+    };
+
+    zero_mask(kq_mask_full);
+    zero_mask(kq_mask_swa);
+}
+
 static void print_mask(const float * data, int64_t n_tokens, int64_t n_kv, int64_t n_swa, llama_swa_type swa_type) {
     LLAMA_LOG_DEBUG("%s: === Attention mask ===\n", __func__);
     const char * swa_type_str = "unknown";
@@ -954,6 +991,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    assistant_kv     (params.assistant_kv),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1890,6 +1928,38 @@ ggml_tensor * llm_graph_context::build_inp_cross_embd() const {
     res->add_input(std::move(inp));
 
     return cur;
+}
+
+llm_graph_input_assistant_kv * llm_graph_context::build_inp_assistant_kv() const {
+    auto inp = std::make_unique<llm_graph_input_assistant_kv>(assistant_kv);
+
+    // head geometry is fixed by the model (must match the target's K/V), so take it from
+    // hparams — assistant_kv may be empty during graph reservation
+    const int64_t n_head_kv     = hparams.n_head_kv();
+    const int64_t head_dim_full = hparams.n_embd_head_k_full;
+    const int64_t head_dim_swa  = hparams.n_embd_head_k_swa;
+    // at least 1 kv position so the input tensors are always well-formed
+    const int64_t n_kv_full     = std::max<int64_t>(assistant_kv->n_kv_full, 1);
+    const int64_t n_kv_swa      = std::max<int64_t>(assistant_kv->n_kv_swa,  1);
+
+    inp->k_full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, head_dim_full, n_head_kv, n_kv_full);
+    inp->v_full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, head_dim_full, n_head_kv, n_kv_full);
+    inp->k_swa  = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, head_dim_swa,  n_head_kv, n_kv_swa);
+    inp->v_swa  = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, head_dim_swa,  n_head_kv, n_kv_swa);
+    ggml_set_input(inp->k_full);
+    ggml_set_input(inp->v_full);
+    ggml_set_input(inp->k_swa);
+    ggml_set_input(inp->v_swa);
+
+    inp->kq_mask_full = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv_full, n_tokens, 1, 1);
+    inp->kq_mask_swa  = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv_swa,  n_tokens, 1, 1);
+    ggml_set_input(inp->kq_mask_full);
+    ggml_set_input(inp->kq_mask_swa);
+
+    inp->kq_mask_full_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->kq_mask_full, GGML_TYPE_F16) : inp->kq_mask_full;
+    inp->kq_mask_swa_cnv  = cparams.flash_attn ? ggml_cast(ctx0, inp->kq_mask_swa,  GGML_TYPE_F16) : inp->kq_mask_swa;
+
+    return (llm_graph_input_assistant_kv *) res->add_input(std::move(inp));
 }
 
 ggml_tensor * llm_graph_context::build_inp_pos_bucket_enc() const {

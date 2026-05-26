@@ -114,6 +114,26 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
+    // fill the shared K/V consumed by the Gemma 4 Assistant draft graph (host copies of
+    // the target's last full-attn + last swa-attn layer K/V, post k_norm+rope,
+    // layout [head_dim, n_head_kv, n_kv])
+    void set_assistant_shared_kv(
+            int64_t n_head_kv,
+            int64_t head_dim_full, const float * k_full, const float * v_full, int64_t n_kv_full,
+            int64_t head_dim_swa,  const float * k_swa,  const float * v_swa,  int64_t n_kv_swa);
+
+    // enable tapping of the target's last full/swa has_kv layer K/V on this (target) context
+    void set_assistant_kv_tap(bool value);
+
+    // return the most recent tap; sets the 4 pointers (any may be ignored) to internal
+    // buffers laid out [head_dim, n_head_kv, n_tokens]; returns n_tokens.
+    // out dims (any may be null): n_head_kv, head_dim_full, head_dim_swa
+    int64_t get_assistant_kv_tap(
+            const float ** k_full, const float ** v_full,
+            const float ** k_swa,  const float ** v_swa,
+            const float ** hidden,
+            int64_t * n_head_kv, int64_t * head_dim_full, int64_t * head_dim_swa) const;
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -273,6 +293,9 @@ private:
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
+    // shared K/V from the target model, consumed by the Gemma 4 Assistant draft graph
+    llama_assistant_shared_kv assistant_kv;
+
     std::unique_ptr<llama_memory_i> memory;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
@@ -286,6 +309,18 @@ private:
     // populated only when cparams.embeddings_pre_norm is enabled and the model graph
     // sets llm_graph_result::t_h_pre_norm
     buffer_view<float> embd_pre_norm = {nullptr, 0};
+
+    // Gemma 4 Assistant KV tap (target side): last full/swa has_kv layer K/V from the most
+    // recent decode, each [head_dim, n_head_kv, n_tokens]. Populated when cparams.assistant_kv_tap.
+    std::vector<float> kv_tap_k_full;
+    std::vector<float> kv_tap_v_full;
+    std::vector<float> kv_tap_k_swa;
+    std::vector<float> kv_tap_v_swa;
+    std::vector<float> kv_tap_hidden; // post-norm hidden, [n_embd_backbone, n_tokens]
+    int64_t kv_tap_n_tokens      = 0;
+    int64_t kv_tap_n_head_kv     = 0;
+    int64_t kv_tap_head_dim_full = 0;
+    int64_t kv_tap_head_dim_swa  = 0;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

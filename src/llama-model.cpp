@@ -38,6 +38,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
     switch (arch) {
         case LLM_ARCH_GEMMA4:
             return new llama_model_gemma4(params);
+        case LLM_ARCH_GEMMA4_ASSISTANT:
+            return new llama_model_gemma4_assistant(params);
         default:
             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
@@ -1690,6 +1692,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_WAVTOKENIZER_DEC:
         case LLM_ARCH_MODERN_BERT:
         case LLM_ARCH_GEMMA_EMBEDDING:
+        case LLM_ARCH_GEMMA4_ASSISTANT: // MTP draft: cross-attends the target's shared K/V, no self cache
         case LLM_ARCH_DREAM:
         case LLM_ARCH_LLADA:
         case LLM_ARCH_LLADA_MOE:
@@ -1908,6 +1911,59 @@ int32_t llama_model_n_ctx_train(const llama_model * model) {
     return model->hparams.n_ctx_train;
 }
 
+int32_t llama_model_get_token_ordering(const llama_model * model, int32_t * out) {
+    const ggml_tensor * t = model->get_tensor("mtp.token_ordering.weight");
+    if (t == nullptr || out == nullptr) {
+        return 0;
+    }
+    const int64_t n = t->ne[0];
+    GGML_ASSERT(t->type == GGML_TYPE_I32);
+    ggml_backend_tensor_get(t, out, 0, (size_t) n * sizeof(int32_t));
+    return (int32_t) n;
+}
+
+int32_t llama_model_get_centroid_params(const llama_model * model, int32_t * n_centroids, int32_t * top_k) {
+    if (n_centroids) { *n_centroids = (int32_t) model->hparams.n_centroids; }
+    if (top_k)       { *top_k       = (int32_t) model->hparams.centroid_top_k; }
+    return (int32_t) model->hparams.n_centroids;
+}
+
+int32_t llama_model_get_output_norm(const llama_model * model, float * out) {
+    const ggml_tensor * t = model->output_norm;
+    if (t == nullptr || out == nullptr) {
+        return 0;
+    }
+    const int64_t n = t->ne[0];
+    GGML_ASSERT(t->type == GGML_TYPE_F32);
+    ggml_backend_tensor_get(t, out, 0, (size_t) n * sizeof(float));
+    return (int32_t) n;
+}
+
+int32_t llama_model_get_token_embd(const llama_model * model, llama_token token, float * out) {
+    const ggml_tensor * te = model->tok_embd;
+    if (te == nullptr || out == nullptr) {
+        return 0;
+    }
+
+    const int64_t n_embd   = te->ne[0];
+    const size_t  row_size = ggml_row_size(te->type, n_embd);
+
+    std::vector<uint8_t> tmp(row_size);
+    ggml_backend_tensor_get(te, tmp.data(), (size_t) token * row_size, row_size);
+
+    if (te->type == GGML_TYPE_F32) {
+        std::memcpy(out, tmp.data(), (size_t) n_embd * sizeof(float));
+    } else if (te->type == GGML_TYPE_F16) {
+        ggml_fp16_to_fp32_row((const ggml_fp16_t *) tmp.data(), out, n_embd);
+    } else {
+        const auto * tt = ggml_get_type_traits(te->type);
+        GGML_ASSERT(tt->to_float != nullptr);
+        tt->to_float(tmp.data(), out, n_embd);
+    }
+
+    return (int32_t) n_embd;
+}
+
 int32_t llama_model_n_embd(const llama_model * model) {
     return model->hparams.n_embd;
 }
@@ -2065,6 +2121,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GEMMA3:
         case LLM_ARCH_GEMMA3N:
         case LLM_ARCH_GEMMA4:
+        case LLM_ARCH_GEMMA4_ASSISTANT:
         case LLM_ARCH_GEMMA_EMBEDDING:
         case LLM_ARCH_STARCODER2:
         case LLM_ARCH_OPENELM:

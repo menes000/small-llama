@@ -42,6 +42,7 @@ static const std::map<std::string, llm_chat_template> LLM_CHAT_TEMPLATES = {
     { "zephyr",            LLM_CHAT_TEMPLATE_ZEPHYR            },
     { "monarch",           LLM_CHAT_TEMPLATE_MONARCH           },
     { "gemma",             LLM_CHAT_TEMPLATE_GEMMA             },
+    { "gemma4",            LLM_CHAT_TEMPLATE_GEMMA_4           },
     { "orion",             LLM_CHAT_TEMPLATE_ORION             },
     { "openchat",          LLM_CHAT_TEMPLATE_OPENCHAT          },
     { "vicuna",            LLM_CHAT_TEMPLATE_VICUNA            },
@@ -151,6 +152,8 @@ llm_chat_template llm_chat_detect_template(const std::string & tmpl) {
         return LLM_CHAT_TEMPLATE_ZEPHYR;
     } else if (tmpl_contains("bos_token + message['role']")) {
         return LLM_CHAT_TEMPLATE_MONARCH;
+    } else if (tmpl_contains("<|tool_call>") || tmpl_contains("<|turn>")) {
+        return LLM_CHAT_TEMPLATE_GEMMA_4;
     } else if (tmpl_contains("<start_of_turn>")) {
         return LLM_CHAT_TEMPLATE_GEMMA;
     } else if (tmpl_contains("'\\n\\nAssistant: ' + eos_token")) {
@@ -371,6 +374,27 @@ int32_t llm_chat_apply_template(
         }
         if (add_ass) {
             ss << "<s>assistant\n";
+        }
+    } else if (tmpl == LLM_CHAT_TEMPLATE_GEMMA_4) {
+        // Gemma 4: turn delimiters are <|turn> (open) and <turn|> (close).
+        // Caller embeds tool definitions (<|tool>...<tool|>) and the optional <|think|>
+        // marker inside the system message content. Tool results come in as role="tool"
+        // and are wrapped here with <|tool_response>...<tool_response|> inside a user turn.
+        ss << "<bos>";
+        for (auto message : chat) {
+            std::string role(message->role);
+            std::string content(message->content ? message->content : "");
+            if (role == "assistant") {
+                role = "model";
+            }
+            if (role == "tool") {
+                ss << "<|turn>user\n<|tool_response>" << content << "<tool_response|><turn|>\n";
+            } else {
+                ss << "<|turn>" << role << "\n" << content << "<turn|>\n";
+            }
+        }
+        if (add_ass) {
+            ss << "<|turn>model\n";
         }
     } else if (tmpl == LLM_CHAT_TEMPLATE_GEMMA) {
         // google/gemma-7b-it

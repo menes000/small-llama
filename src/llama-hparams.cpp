@@ -71,6 +71,12 @@ uint32_t llama_hparams::n_rot(uint32_t il) const {
 }
 
 uint32_t llama_hparams::n_embd_inp() const {
+    // Gemma 4 Assistant: the model input is the concatenation of the target's token
+    // embedding and hidden state (2 * backbone width), projected by pre_projection.
+    if (n_embd_backbone > 0) {
+        return 2 * n_embd_backbone;
+    }
+
     uint32_t n_embd_inp = n_embd;
 
     if (n_deepstack_layers > 0) {

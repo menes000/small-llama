@@ -74,6 +74,25 @@ struct llama_cross {
     std::vector<std::set<llama_seq_id>> seq_ids_enc;
 };
 
+// Shared K/V copied from the target model, consumed by the Gemma 4 Assistant draft.
+// Each tensor is laid out as ggml [head_dim, n_head_kv, n_kv] and is already
+// post-(k_norm + rope), i.e. exactly the values the target stored in its cache.
+// One set for full-attention layers, one for sliding-window layers.
+struct llama_assistant_shared_kv {
+    int64_t n_head_kv     = 0;
+    int64_t head_dim_full = 0;
+    int64_t head_dim_swa  = 0;
+    int64_t n_kv_full     = 0;
+    int64_t n_kv_swa      = 0;
+
+    std::vector<float> k_full;
+    std::vector<float> v_full;
+    std::vector<float> k_swa;
+    std::vector<float> v_swa;
+
+    bool empty() const { return n_kv_full == 0 && n_kv_swa == 0; }
+};
+
 struct llm_graph_params;
 
 //
@@ -258,6 +277,30 @@ public:
     ggml_tensor * cross_embd; // F32 [n_embd, n_outputs_enc]
 
     const llama_cross * cross;
+};
+
+// Carries the target model's shared K/V (+ attention masks) into the Gemma 4
+// Assistant draft graph. Mirrors llm_graph_input_cross_embd (host-memory copy).
+class llm_graph_input_assistant_kv : public llm_graph_input_i {
+public:
+    llm_graph_input_assistant_kv(const llama_assistant_shared_kv * akv) : akv(akv) {}
+    virtual ~llm_graph_input_assistant_kv() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * k_full = nullptr; // F32 [head_dim_full, n_head_kv, n_kv_full]
+    ggml_tensor * v_full = nullptr; // F32 [head_dim_full, n_head_kv, n_kv_full]
+    ggml_tensor * k_swa  = nullptr; // F32 [head_dim_swa,  n_head_kv, n_kv_swa]
+    ggml_tensor * v_swa  = nullptr; // F32 [head_dim_swa,  n_head_kv, n_kv_swa]
+
+    ggml_tensor * kq_mask_full = nullptr; // F32 [n_kv_full, n_tokens]
+    ggml_tensor * kq_mask_swa  = nullptr; // F32 [n_kv_swa,  n_tokens]
+
+    // flash-attn consumes an F16 mask; these are the (optionally) cast views fed to build_attn_mha
+    ggml_tensor * kq_mask_full_cnv = nullptr;
+    ggml_tensor * kq_mask_swa_cnv  = nullptr;
+
+    const llama_assistant_shared_kv * akv;
 };
 
 class llm_graph_input_attn_no_cache : public llm_graph_input_i {
@@ -545,6 +588,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_assistant_shared_kv * assistant_kv;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -631,7 +675,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            assistant_kv == other.assistant_kv;
     }
 };
 
@@ -646,6 +691,12 @@ public:
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_pre_norm()  const { return t_h_pre_norm; }
+
+    ggml_tensor * get_kv_tap_k_full() const { return t_kv_tap_k_full; }
+    ggml_tensor * get_kv_tap_v_full() const { return t_kv_tap_v_full; }
+    ggml_tensor * get_kv_tap_k_swa()  const { return t_kv_tap_k_swa;  }
+    ggml_tensor * get_kv_tap_v_swa()  const { return t_kv_tap_v_swa;  }
+    ggml_tensor * get_kv_tap_hidden() const { return t_kv_tap_hidden; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -675,6 +726,14 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_pre_norm  = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+
+    // Gemma 4 Assistant KV tap: the target's last full/swa has_kv layer K/V for this batch,
+    // each [head_dim, n_head_kv, n_tokens], post k_norm+rope. Set only when cparams.assistant_kv_tap.
+    ggml_tensor * t_kv_tap_k_full = nullptr;
+    ggml_tensor * t_kv_tap_v_full = nullptr;
+    ggml_tensor * t_kv_tap_k_swa  = nullptr;
+    ggml_tensor * t_kv_tap_v_swa  = nullptr;
+    ggml_tensor * t_kv_tap_hidden = nullptr; // [n_embd, n_tokens] post-norm hidden
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
@@ -761,6 +820,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_assistant_shared_kv * assistant_kv;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -888,6 +948,7 @@ struct llm_graph_context {
     ggml_tensor * build_inp_cls() const;
 
     ggml_tensor * build_inp_cross_embd() const;
+    llm_graph_input_assistant_kv * build_inp_assistant_kv() const;
     ggml_tensor * build_inp_pos_bucket_enc() const;
     ggml_tensor * build_inp_pos_bucket_dec() const;
     ggml_tensor * build_pos_bias(ggml_tensor * pos_bucket, ggml_tensor * attn_rel_b) const;

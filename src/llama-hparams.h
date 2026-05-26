@@ -94,6 +94,12 @@ struct llama_hparams {
 
     bool kv_only_nextn = false; // if true, only the last nextn_predict_layers blocks have a KV cache (MTP head arches)
 
+    // Gemma 4 Assistant (MTP draft head)
+    uint32_t n_embd_backbone        = 0;     // hidden size of the target model this assistant attends to
+    uint32_t n_centroids            = 0;     // VQ codebook size for the masked-embedding logit head
+    uint32_t centroid_top_k         = 0;     // number of active centroids per token
+    bool     use_ordered_embeddings = false; // use the centroid (ordered-embedding) logit head
+
     float f_norm_eps;
     float f_norm_rms_eps;
     float f_norm_group_eps;
