@@ -307,12 +307,42 @@ system content'ine gömüyor.
 
 ### E4B (target 4B Q8, draft F16) — Metal -ngl 99
 
+**Eski (rebuild fix öncesi):**
+
 | Test | Tool | t/s | Acc | Round | Hızlanma |
 |------|------|----:|----:|------:|---------:|
 | baseline | llama-spec | 29.4 | — | — | 1.00× |
-| count 1-100 (n=3) | llama-spec | **49.8** | %85 | 83 | **1.69×** |
+| count 1-100 (n=3) | llama-spec | 49.8 | %85 | 83 | 1.69× |
 | photosynthesis (n=3) | llama-spec | 38.0 | %55 | — | 1.29× |
 | Eiffel (n=3) | llama-spec | 30.6 | %52 | — | 1.03× |
+
+**REBUILD FIX SONRASI (yeni, llama-chat) — kapsamlı bench:**
+
+| Prompt | Baseline | SD (n=3) | Hızlanma | Acc | Yorum |
+|--------|---------:|---------:|---------:|----:|-------|
+| First 50 primes | 28.5 | **73.6** | **2.58×** | %99 | Şampiyon — düzenli liste |
+| First 50 primes (n=5) | 28.5 | 70.7 | 2.48× | %89 | Daha düşük acc |
+| Verbs list (alphab) | 27.6 | 52.0 | 1.88× | %60 | Liste, orta tahmin |
+| Python factorial | (~28) | 62.6 | 2.20× | %76 | Kod, kalıplı |
+| Python reverse string | 27.2 | 50.8 | 1.87× | %59 | Kod |
+| Count 1-50 | (~28) | 62.4 | 2.19× | %81 | Sayma |
+| Database index açıklama | 27.4 | 36.8 / 32.9 | 1.20-1.29× | %25-33 | Açıklayıcı düz metin |
+| TCP açıklama | 27.4 | 32.9 | 1.20× | %25 | Açıklayıcı |
+| Sea poem | 25.8 | 29.2 | 1.13× | %26 | Yaratıcı |
+| Autumn haiku | (~28) | 28.0 | 0.98× | %25 | Yaratıcı kısa |
+| Translate FR (10 tok) | 20.8 | 26.7 | 1.28× | %33 | Çok kısa, prefill domine |
+
+**Pattern (acc rate doğrudan hızla korele):**
+- %99 acc → 2.58× (teorik max'a yakın)
+- %60-80 acc → 1.9-2.2×
+- %25-35 acc → 1.1-1.3× (overhead kazancı yiyor)
+
+**Yapısal görevde 3× hedefe %88 ulaşıldı (2.58/3.0). Yaratıcı metinde SD net etkisiz/marjinal.**
+
+**Q8 draft assistant testi (E4B):** F16 (174 MB) vs Q8 (100 MB) — hız ve acc rate aynı
+(±1 t/s, gürültü). Beklenen +%10-15 kazanç gerçekleşmedi. Sebep: draft model çok küçük
+(78M params), round'daki payı sadece ~%10. Bandwidth halve marjinal etki. **Q8'in tek avantajı
+disk/RAM tasarrufu** (~75 MB).
 
 **Pattern:** kazanç prompt tahmin edilebilirliğiyle orantılı, model boyutuyla orantılı.
 
