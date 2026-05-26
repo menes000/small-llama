@@ -423,6 +423,40 @@ int main(int argc, char ** argv) {
     int64_t turn_prefill_us = 0;
     int64_t turn_gen_us     = 0;
 
+    // Reset target+draft KV state and shrink the chat history down to {system, last_user}.
+    // Used when (a) the KV cache is about to overflow (proactive) or (b) a decode failed
+    // mid-turn and the context is in an unknown state (reactive). System message + the most
+    // recent user message are preserved so the model can answer the current query fresh.
+    // keep_last_user=true (proactive case): user msg pushed but not yet processed → keep it
+    // keep_last_user=false (reactive case): user msg ALREADY processed (and the turn died).
+    //   Drop everything except system; next REPL iteration will push a fresh user msg.
+    auto reset_chat = [&](bool keep_last_user) {
+        std::string sys_content, usr_content;
+        if (msg_storage.size() >= 2 && msg_storage[0] == "system") {
+            sys_content = msg_storage[1];
+        }
+        if (keep_last_user) {
+            for (size_t i = msg_storage.size(); i >= 2; i -= 2) {
+                if (msg_storage[i - 2] == "user") {
+                    usr_content = msg_storage[i - 1];
+                    break;
+                }
+                if (i < 2) { break; }
+            }
+        }
+        msg_storage.clear();
+        msgs.clear();
+        if (!sys_content.empty()) { push_msg("system", sys_content); }
+        if (!usr_content.empty()) { push_msg("user",   usr_content); }
+
+        llama_memory_seq_rm(llama_get_memory(ctx), /*seq_id=*/0, 0, -1);
+        if (sd_on && ctx_d) { llama_memory_seq_rm(llama_get_memory(ctx_d), 0, 0, -1); }
+        kv_pos = 0;
+        last_formatted.clear();
+        acc_kf.clear(); acc_vf.clear(); acc_ks.clear(); acc_vs.clear();
+        acc_nkv = 0;
+    };
+
     auto run_inference = [&](int max_new_tokens, std::string & assistant_text) -> bool {
         // Build full prompt, identify the unprocessed tail, decode it, then sample.
         const std::string formatted = apply_template(model, msgs, /*add_ass=*/true);
@@ -442,7 +476,7 @@ int main(int argc, char ** argv) {
         // SD mode we must drain the tap into the persistent accumulator AFTER EVERY chunk
         // (not once at the end — that would only capture the last chunk's positions).
         const int64_t prefill_t0 = ggml_time_us();
-        turn_prefill_tok += (int64_t) tail_tokens.size();
+        // count tokens AFTER each successful chunk so the rate stays honest if decode fails partway
         for (size_t off = 0; off < tail_tokens.size(); ) {
             const int n = (int) std::min<size_t>(a.n_batch, tail_tokens.size() - off);
             batch.n_tokens = 0;
@@ -457,6 +491,7 @@ int main(int argc, char ** argv) {
             if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "[chat] decode failed\n"); return false; }
             kv_pos += n;
             off    += n;
+            turn_prefill_tok += n;   // count only what actually completed
 
             if (sd_on) {
                 const float *kf=nullptr,*vf=nullptr,*ks=nullptr,*vs=nullptr,*hid=nullptr;
@@ -656,6 +691,16 @@ int main(int argc, char ** argv) {
 
         push_msg("user", line);
 
+        // Proactive: if last turn's accumulated context is nearing capacity, rotate now —
+        // BEFORE we try to feed an arbitrarily long tail (e.g. a fresh tool result). 1024
+        // tokens of headroom leaves room for the user msg, assistant prefix, and a few
+        // SD verify batches.
+        if (acc_nkv > (int64_t) a.n_ctx - 1024) {
+            fprintf(stderr, "[chat] context near full (acc=%lld / ctx=%d) -> rotating history (keeping system + last user)\n",
+                    (long long) acc_nkv, a.n_ctx);
+            reset_chat(/*keep_last_user=*/true);
+        }
+
         // per-turn stats: total across tool hops
         turn_emitted = turn_rounds = turn_drafted = turn_accepted = 0;
         turn_prefill_tok = 0;
@@ -664,9 +709,10 @@ int main(int argc, char ** argv) {
 
         // run model, possibly looping for tool calls
         std::string assistant_raw;
+        bool decode_broke = false;
         for (int hop = 0; hop < 4; ++hop) { // cap tool-call hops to avoid infinite loops
             assistant_raw.clear();
-            if (!run_inference(a.n_predict, assistant_raw)) { break; }
+            if (!run_inference(a.n_predict, assistant_raw)) { decode_broke = true; break; }
 
             // detect tool call
             std::string tname, targs;
@@ -702,6 +748,21 @@ int main(int argc, char ** argv) {
             // <|tool_response>...<tool_response|>
             push_msg("tool", tname + "{" + result + "}");
             // re-prompt: loop
+        }
+
+        // Reactive recovery: if any decode failed during this turn (KV exhausted, allocator
+        // issue, etc.) the context is in an unknown state. Rotate down to {system, last user}
+        // and clear KV so the NEXT turn can start fresh instead of cascading failures.
+        if (decode_broke) {
+            fprintf(stderr, "[chat] decode failed during turn -> resetting (system only); next prompt starts fresh\n");
+            reset_chat(/*keep_last_user=*/false);
+        }
+
+        // UX: if the model produced nothing (first sampled token was EOG and the turn ended
+        // empty), make it visible — otherwise the user sees only the next prompt and may
+        // think the binary hung.
+        if (!decode_broke && turn_emitted == 0) {
+            fprintf(stderr, "[chat] (model produced no output for this turn)\n");
         }
 
         // turn-end stats. We report generation t/s (pure decode time) — the apples-to-apples

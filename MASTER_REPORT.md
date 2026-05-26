@@ -268,7 +268,25 @@ system content'ine gömüyor.
   daima `add_special=false`.
 - **stderr log spam:** llama internal log'ları stdout'u boğuyor, kullanıcı cevabı tam
   göremiyor. Fix: `llama_log_set(cb)` ile filtre — WARN ve üzeri görünür, INFO/DEBUG gizli
-  (LLAMA_VERBOSE=1 ile aç).
+  (LLAMA_VERBOSE=1 ile aç). Ayrıca tüm verbose log'lar `logs/session-YYYYMMDD-HHMMSS.log`
+  dosyasına yazılıyor (sonra inceleme için).
+- **KV cache exhaustion cascade (sonradan bulundu):** uzun tool result (README, log dosyası)
+  veya çok turn sonrası `acc_nkv` n_ctx'e yaklaşıyor → `llama_decode` `failed to find a
+  memory slot for batch of size N` döner → state korrupt, sonraki turn'ler de patlar
+  (`decode failed`, `gen=0 tok`). Belirti: 3-4 ardışık decode fail.
+  **Fix iki katmanlı:**
+  1. **Proactive**: REPL turn başında `acc_nkv > n_ctx - 1024` ise history rotate edilir
+     (system msg + sadece yeni user msg tutulur; KV temizlenir).
+  2. **Reactive**: decode fail olduğunda `reset_chat(keep_last_user=false)` çağrılır —
+     sadece system msg kalır, sonraki user prompt fresh başlar. `llama_memory_seq_rm` ile
+     target + draft KV cache temizlenir, acc K/V vektörleri ve `last_formatted` sıfırlanır.
+- **Prefill counter inaccurate when decode fails (sonradan):** `turn_prefill_tok` peşin
+  sayılıyordu (`+= tail.size()`); decode chunk ortasında fail olunca counter tam, süre kısa
+  → bogus rate (`prefill=6094 tok / 0.11s = 57628 t/s`). **Fix:** her başarılı chunk
+  decode'undan sonra `turn_prefill_tok += n` (gerçekten işlenen).
+- **Empty turn (gen=0) UX (sonradan):** model bazen ilk token olarak EOG sample ediyor →
+  turn boş bitiyor → kullanıcı hang sanıyor. **Fix:** `[chat] (model produced no output
+  for this turn)` notu basılır.
 
 ---
 
@@ -478,9 +496,12 @@ yapısal görevde ~3×'e yaklaştırır (özellikle E4B + adaptive n ile).
 5. **Tool arg parsing tek `path` argümanı için optimize.** Multi-arg tool'lar için genişletme
    gerek.
 6. **Greedy sampling sabit.** Top-k/temperature yok. Eklemek için `llama_sampler` kullanılabilir.
-7. **Geliştirme persistence yok.** Program kapanınca history kaybolur.
+7. **Geliştirme persistence yok.** Program kapanınca history kaybolur. Tüm verbose log
+   `logs/session-*.log` dosyasında.
 8. **Adaptive n yok** (yukarıda önerildi).
 9. **Per-round graph rebuild kaldırılmadı** (yukarıda önerildi).
+10. **History rotation kayıp veri demek.** Cache dolunca eski mesajlar atılır; model önceki
+    bağlamı hatırlamaz. Daha akıllı: summarize-then-evict (gelecek iş).
 
 ---
 
