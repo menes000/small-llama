@@ -1121,11 +1121,23 @@ void llama_context::set_assistant_shared_kv(
         int64_t n_head_kv,
         int64_t head_dim_full, const float * k_full, const float * v_full, int64_t n_kv_full,
         int64_t head_dim_swa,  const float * k_swa,  const float * v_swa,  int64_t n_kv_swa) {
+    // Bucket actual n_kv to the next power-of-2 (min 256). The draft graph is allocated to
+    // the bucket size; within the bucket we reuse the graph (mask hides unused positions).
+    auto bucket = [](int64_t n) -> int64_t {
+        int64_t b = 256;
+        while (b < n) { b *= 2; }
+        return b;
+    };
+    const int64_t cap_full = bucket(std::max<int64_t>(n_kv_full, 1));
+    const int64_t cap_swa  = bucket(std::max<int64_t>(n_kv_swa,  1));
+
     assistant_kv.n_head_kv     = n_head_kv;
     assistant_kv.head_dim_full = head_dim_full;
     assistant_kv.head_dim_swa  = head_dim_swa;
     assistant_kv.n_kv_full     = n_kv_full;
     assistant_kv.n_kv_swa      = n_kv_swa;
+    assistant_kv.n_kv_full_cap = cap_full;
+    assistant_kv.n_kv_swa_cap  = cap_swa;
 
     const size_t n_full = (size_t) head_dim_full * n_head_kv * n_kv_full;
     const size_t n_sw   = (size_t) head_dim_swa  * n_head_kv * n_kv_swa;
@@ -1135,9 +1147,12 @@ void llama_context::set_assistant_shared_kv(
     assistant_kv.k_swa .assign(k_swa,  k_swa  + n_sw);
     assistant_kv.v_swa .assign(v_swa,  v_swa  + n_sw);
 
-    // the draft graph bakes n_kv into its input tensor shapes, so it must be rebuilt
-    // whenever the shared K/V length changes
-    sched_need_reserve = true;
+    // rebuild ONLY when bucket crosses a doubling boundary; within a bucket the graph is reused
+    if (cap_full > prev_assistant_n_kv_full_cap || cap_swa > prev_assistant_n_kv_swa_cap) {
+        prev_assistant_n_kv_full_cap = cap_full;
+        prev_assistant_n_kv_swa_cap  = cap_swa;
+        sched_need_reserve = true;
+    }
 }
 
 void llama_context::set_assistant_kv_tap(bool value) {

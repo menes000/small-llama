@@ -297,8 +297,10 @@ system content'ine gömüyor.
 | Test | Tool | t/s | Acc | Round | Hızlanma |
 |------|------|----:|----:|------:|---------:|
 | baseline (no SD) | llama-spec/chat | 51 | — | — | 1.00× |
-| primes (n=5) | llama-spec | **80.6** | %78 | — | **1.58×** |
-| primes (n=5) | llama-chat | 57.3 | %79 | 24 | 1.12× |
+| **primes (n=5) — REBUILD FIX SONRASI** | llama-chat | **114.7** | %87 | 43 | **2.25×** |
+| **primes (n=5) — REBUILD FIX SONRASI** | llama-spec | **106.1** | %82 | 45 | **2.08×** |
+| primes (n=5) — fix öncesi | llama-spec | 80.6 | %78 | — | 1.58× |
+| primes (n=5) — fix öncesi | llama-chat | 57.3 | %79 | 24 | 1.12× |
 | count 1-100 (n=2) | llama-spec | 53.1 | %62 | — | 1.04× |
 | Eiffel paragraf (n=2) | llama-spec | 50.6 | %52 | — | 1.00× |
 | robot hikayesi (n=2) | llama-spec | 41.5 | %39 | — | 0.81× |
@@ -370,21 +372,36 @@ E4B'de adaptive n + graph rebuild fix ile 2.5-3× erişilebilir.
 
 ## 7. 3×'e ulaşmak için yol haritası
 
-### 7.1 Per-round graph rebuild eliminasyonu (en yüksek değerli)
+### 7.1 Per-round graph rebuild eliminasyonu ✅ TAMAMLANDI
 
-**Sorun:** Her draft round'da n_kv büyüyor → tensor şekli değişiyor → graph rebuild.
+**Sorun:** Her draft round'da n_kv büyüyor → tensor şekli değişiyor → graph rebuild
+(~15-20 ms/round CPU-side).
 
-**Çözüm:** Draft graph'ı sabit kapasiteli (n_ctx) inşa et + attention mask ile gerçek n_kv'ye
-kısıtla.
+**Yapılan çözüm:** Bucketed K/V capacity + padded mask.
+- `llama_assistant_shared_kv` struct'a `n_kv_full_cap` / `n_kv_swa_cap` alanları
+- `set_assistant_shared_kv` bucket'ı (next-power-of-2, min 256) hesaplar; sadece bucket
+  büyürse `sched_need_reserve=true` set eder
+- `build_inp_assistant_kv` tensor'ları `n_kv_cap` boyutunda alloc eder (actual değil)
+- `set_input` actual K/V'yi buffer'ın başına kopyalar, tail zero-fill; mask `[0, actual)=0`,
+  `[actual, cap)=-INF` ile unused pozisyonları softmax'ta sıfırlar
+- Session başına ~5 rebuild (256→512→1024→2048→4096), eskiden round başına 1 (~50+/turn)
+- Toplam: ~55 satır eklenti (`llama-graph.{h,cpp}` + `llama-context.{h,cpp}`)
 
-- `build_inp_assistant_kv` input tensor'larını `n_kv = n_ctx` (sabit, max kapasite) ile alloc
-- Her round'da K/V buffer'ın sadece ilk `acc_nkv` pozisyonunu doldur, gerisi -∞ mask
-- `sched_need_reserve` kalkar
-- Graph bir kez reserve edilir, sonra reuse
+**Ölçülen etki (E2B, Metal -ngl 99):**
 
-**Tahmini etki:** Round overhead 48 → ~25 ms. E2B'de 80 → 100+ t/s, **E4B'de 50 → 70+ t/s**.
+| Test | Önce | Sonra | Δ |
+|------|-----:|------:|--:|
+| **llama-chat primes (n=5)** | 57 t/s | **114.7 t/s** | **+%100** |
+| **llama-spec primes (n=5)** | 80 t/s | **106.1 t/s** | **+%32** |
+| baseline (greedy) | 51 t/s | 51 t/s | aynı |
+| acc_rate (primes) | %79 | %87 | +%8 |
+| Lossless | ✓ | ✓ | — |
 
-**Tahmini LOC:** ~80 satır (`llama-graph.cpp` + `gemma4_assistant.cpp` + ufak context değişikliği).
+**E2B chat artık baseline'ın 2.25× hızında** (yapısal görevde). chat'in ekstra kazancı (%32
+yerine %100) chat-spesifik per-round overhead'in (tail tokenize, template apply) de tek-seferlik
+olmasından geliyor.
+
+**Beklenen E4B etkisi (denenmedi):** baseline 30 → 60-70 t/s = ~2-2.3× (test edilecek).
 
 ### 7.2 Adaptive draft length
 

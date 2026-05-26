@@ -351,38 +351,52 @@ void llm_graph_input_cross_embd::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_assistant_kv::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
-    auto copy_kv = [](ggml_tensor * dst, const std::vector<float> & src) {
-        if (dst == nullptr) {
-            return;
-        }
+    // K/V destination tensors are allocated to the bucketed CAPACITY (n_kv_full_cap).
+    // The source vector holds the ACTUAL n_kv_full positions. Copy actual to the front
+    // of the buffer and zero-fill the unused tail (so masked attention sees defined zeros
+    // rather than uninitialized backend memory).
+    auto copy_kv_padded = [](ggml_tensor * dst, const std::vector<float> & src) {
+        if (dst == nullptr) { return; }
         assert(dst->type == GGML_TYPE_F32);
-        if (!src.empty()) {
-            assert((size_t) ggml_nelements(dst) == src.size());
-            ggml_backend_tensor_set(dst, src.data(), 0, ggml_nbytes(dst));
-        } else {
-            // no shared K/V supplied yet: zero-fill so the graph is well-defined
+        const size_t dst_bytes = ggml_nbytes(dst);
+        if (src.empty()) {
             std::vector<float> zeros(ggml_nelements(dst), 0.0f);
-            ggml_backend_tensor_set(dst, zeros.data(), 0, ggml_nbytes(dst));
-        }
-    };
-
-    copy_kv(k_full, akv->k_full);
-    copy_kv(v_full, akv->v_full);
-    copy_kv(k_swa,  akv->k_swa);
-    copy_kv(v_swa,  akv->v_swa);
-
-    // attend-all masks (additive bias 0). Sliding-window restriction is applied by the
-    // caller via n_kv_swa (only the in-window target K/V are supplied).
-    auto zero_mask = [](ggml_tensor * dst) {
-        if (dst == nullptr) {
+            ggml_backend_tensor_set(dst, zeros.data(), 0, dst_bytes);
             return;
         }
-        std::vector<float> zeros(ggml_nelements(dst), 0.0f);
-        ggml_backend_tensor_set(dst, zeros.data(), 0, ggml_nbytes(dst));
+        const size_t src_bytes = src.size() * sizeof(float);
+        assert(src_bytes <= dst_bytes);
+        ggml_backend_tensor_set(dst, src.data(), 0, src_bytes);
+        if (src_bytes < dst_bytes) {
+            std::vector<float> zeros((dst_bytes - src_bytes) / sizeof(float), 0.0f);
+            ggml_backend_tensor_set(dst, zeros.data(), src_bytes, dst_bytes - src_bytes);
+        }
     };
 
-    zero_mask(kq_mask_full);
-    zero_mask(kq_mask_swa);
+    // Mask: per-token row. Positions [0, n_kv_actual) get additive bias 0 (visible);
+    // positions [n_kv_actual, n_kv_cap) get -INFINITY → softmax → 0 (hidden).
+    auto build_padded_mask = [](ggml_tensor * dst, int64_t n_kv_actual) {
+        if (dst == nullptr) { return; }
+        assert(dst->type == GGML_TYPE_F32);
+        const int64_t n_kv_cap = dst->ne[0];
+        const int64_t n_tokens = dst->ne[1];
+        std::vector<float> mask((size_t) n_kv_cap * n_tokens);
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            const int64_t base = t * n_kv_cap;
+            const int64_t lim  = std::min<int64_t>(n_kv_actual, n_kv_cap);
+            for (int64_t k = 0; k < lim;        ++k) { mask[base + k] = 0.0f; }
+            for (int64_t k = lim; k < n_kv_cap; ++k) { mask[base + k] = -INFINITY; }
+        }
+        ggml_backend_tensor_set(dst, mask.data(), 0, ggml_nbytes(dst));
+    };
+
+    copy_kv_padded(k_full, akv->k_full);
+    copy_kv_padded(v_full, akv->v_full);
+    copy_kv_padded(k_swa,  akv->k_swa);
+    copy_kv_padded(v_swa,  akv->v_swa);
+
+    build_padded_mask(kq_mask_full, akv->n_kv_full);
+    build_padded_mask(kq_mask_swa,  akv->n_kv_swa);
 }
 
 static void print_mask(const float * data, int64_t n_tokens, int64_t n_kv, int64_t n_swa, llama_swa_type swa_type) {
@@ -1938,9 +1952,15 @@ llm_graph_input_assistant_kv * llm_graph_context::build_inp_assistant_kv() const
     const int64_t n_head_kv     = hparams.n_head_kv();
     const int64_t head_dim_full = hparams.n_embd_head_k_full;
     const int64_t head_dim_swa  = hparams.n_embd_head_k_swa;
-    // at least 1 kv position so the input tensors are always well-formed
-    const int64_t n_kv_full     = std::max<int64_t>(assistant_kv->n_kv_full, 1);
-    const int64_t n_kv_swa      = std::max<int64_t>(assistant_kv->n_kv_swa,  1);
+    // Use the BUCKETED capacity (rounded up to next power-of-2). Within a bucket the graph
+    // is reused; the mask in set_input zeroes out the unused [n_kv_actual..n_kv_cap) range.
+    // Fall back to actual + min=1 if cap not yet set (e.g. first reserve before any decode).
+    const int64_t n_kv_full     = std::max<int64_t>(assistant_kv->n_kv_full_cap > 0
+                                                    ? assistant_kv->n_kv_full_cap
+                                                    : assistant_kv->n_kv_full, 1);
+    const int64_t n_kv_swa      = std::max<int64_t>(assistant_kv->n_kv_swa_cap > 0
+                                                    ? assistant_kv->n_kv_swa_cap
+                                                    : assistant_kv->n_kv_swa, 1);
 
     inp->k_full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, head_dim_full, n_head_kv, n_kv_full);
     inp->v_full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, head_dim_full, n_head_kv, n_kv_full);

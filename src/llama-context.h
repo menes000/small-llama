@@ -322,6 +322,12 @@ private:
     int64_t kv_tap_head_dim_full = 0;
     int64_t kv_tap_head_dim_swa  = 0;
 
+    // Tracked across set_assistant_shared_kv() calls so the assistant draft graph is rebuilt
+    // ONLY when the bucketed K/V capacity grows past its previous high-water mark. Within a
+    // bucket the graph (and ggml-alloc scheduler plan) is reused unchanged.
+    int64_t prev_assistant_n_kv_full_cap = 0;
+    int64_t prev_assistant_n_kv_swa_cap  = 0;
+
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;

@@ -82,10 +82,12 @@ struct llama_assistant_shared_kv {
     int64_t n_head_kv     = 0;
     int64_t head_dim_full = 0;
     int64_t head_dim_swa  = 0;
-    int64_t n_kv_full     = 0;
+    int64_t n_kv_full     = 0;   // actual used positions (for mask)
     int64_t n_kv_swa      = 0;
+    int64_t n_kv_full_cap = 0;   // bucketed capacity (>= n_kv_full); graph tensors sized to this
+    int64_t n_kv_swa_cap  = 0;
 
-    std::vector<float> k_full;
+    std::vector<float> k_full;   // size = n_kv_full * head_dim_full * n_head_kv (actual, not padded)
     std::vector<float> v_full;
     std::vector<float> k_swa;
     std::vector<float> v_swa;
