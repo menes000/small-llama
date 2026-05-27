@@ -532,6 +532,112 @@ yapısal görevde ~3×'e yaklaştırır (özellikle E4B + adaptive n ile).
 
 ---
 
+## 7.5 Denenip işe yaramayan / geri alınan değişiklikler
+
+Şeffaflık için: kazançlar kadar başarısızlıklar da kayda alındı. Negatif sonuçlar gelecek
+oturumlarda aynı yola girilmesini önler.
+
+### A. Faz 1 — Incremental K/V upload + mask delta (geri alındı)
+
+**Hipotez:** Her round'da TÜM `acc->k_full` (~2-3 MB) GPU'ya yükleniyor. Sadece YENİ pozisyonları
+(1-3 token) yüklesek round başı ~3-5ms tasarruf, E2B chat 114 → 130-140 t/s.
+
+**Uygulanan değişiklik (~80 satır, `src/llama-graph.{h,cpp}` + `set_input` refactor):**
+- `llm_graph_input_assistant_kv`'ye `prev_n_kv_*_uploaded`, `prev_mask_*_actual`, `first_call_after_alloc` state
+- İlk çağrı: full init. Sonraki: `ggml_backend_tensor_set` ile sadece `[prev..new)` aralığı
+- Mask delta: sadece değişen `[prev_actual..new_actual)` range güncelle
+- Bucket min 256 → 1024 değişikliği de bundle'a dahil edildi
+
+**Ölçüm sonucu (E2B chat primes n=5, baseline 51 t/s):**
+- Önceden (cf9d17f, rebuild fix): **114.7 t/s**
+- Faz 1 (incremental + bucket 1024): **99.7 t/s** (-13%) — YAVAŞ
+- Faz 1 (incremental + bucket 256): **111.6 t/s** (-3%) — marjinal yavaş
+
+**Kök sebep:**
+1. **Bucket 1024 cap-büyütmesi attention compute'unu ~4× artırdı.** Mask -INF unused pozisyonlar
+   için softmax sıfırlasa da `Q @ K^T` matmul tüm cap pozisyonları için çalışır.
+   n_kv=50 actual, cap=1024 → matmul 1024 üzerinden = ~20× boş compute → +4-5 ms/round.
+2. **Incremental upload byte tasarrufu ≠ time tasarrufu.** `ggml_backend_tensor_set` call başına
+   CPU-side sync overhead ~50-200μs. Önceden 6 büyük call → 600μs. Faz 1: 8 küçük call → 800μs.
+   Byte ~10x küçüldü ama call SAYISI arttı (mask için per-token-row). Net: yavaş.
+
+**Karar:** `git checkout HEAD -- ...` ile geri alındı. cf9d17f (rebuild fix + bucket 256, full upload)
+optimal nokta.
+
+**Ders:** Small-data regiminde call overhead bytes'tan baskın. Optimization yapılırken
+**call count + bytes** ikisi birden minimize edilmeli. Faz 1 sadece bytes'ı azalttı.
+
+### B. Bucket min 1024 (deneme, geri alındı)
+
+Pre-warm avantajı için bucket min'i 256→1024 yapıldı. Sonuç: short-context turn'lerde
+attention compute ~4× boş çalıştı → çıktı yavaşladı. 256 sweet spot.
+
+### C. Q8 draft assistant (test edildi, kazanç yok)
+
+**Hipotez:** F16 draft (174 MB) → Q8 (100 MB) → memory bandwidth halve → draft forward ~%30
+hızlı → E4B SD +%10-15.
+
+**Test sonucu (E4B chat, draft-max 3):**
+| Prompt | F16 t/s | Q8 t/s | Δ |
+|--------|--------:|-------:|--:|
+| Primes 50 | 74.3 | 75.0 | +0.7 (gürültü) |
+| Python reverse | 50.2 | 48.5 | -1.7 (gürültü) |
+| TCP açıklama | 33.3 | 31.8 | -1.5 (gürültü) |
+
+**acc rate** F16 ve Q8'de aynı (%99 / %59 / %25). Centroid head precision Q8'de bozulmamış.
+
+**Kök sebep:**
+- Draft model çok küçük (78M params, 174 MB F16). Per-forward ~1-2 ms. Bandwidth-bound değil
+  **compute/launch-overhead-bound** Metal'de.
+- Round'da draft cost zaten küçük pay (~%10). Halve etsen tasarruf round'un %5'i.
+
+**Karar:** Q8 sadece disk/RAM tasarrufu (75 MB), hız aynı. F16 kalıyor (varsayılan).
+
+### D. Tier 3 (GPU-persistent K/V buffer) — analiz edildi, henüz uygulanmadı
+
+**Beklenen kazanç hesabı:**
+- E4B primes (%99 acc, şu an 74 t/s)
+- Teorik max (round başı maliyet sıfır): ~90 t/s (round = 35 ms verify + 9 ms draft, 4 token/round)
+- 74/90 = **%82 teorik max'a yakın** zaten
+- Tier 3 sadece K/V upload + sync overhead'ini eler (~3-5 ms/round). Beklenen 74 → 80 t/s = **+%8**
+
+**ROI:** ~150 LOC + ggml backend buffer ownership + scheduler etkileşim riski karşılığında %8.
+Modest.
+
+**3× hedefine ulaşmaz.** Yapısal görevde 2.6× → ~2.8× yapar. 3×'e gelmek için MEDUSA tarzı
+tree drafting (~500 LOC, büyük redesign) ya da daha hızlı draft model arch gerek.
+
+**Karar:** Şimdilik ertelendi. Yapılabilir ama meyve modest, risk var.
+
+### E. Faz 1 pre-warm bucket transitions (Tier 4-A) — yapılmadı
+
+İlk turn'de gizli warm-up'la bucket 256/512/1024 hepsini reserve et → kullanıcı ilk turn'de
+delay yaşamaz. UX iyileştirmesi, hız etkisi yok. Faz 1 başarısız olduğu için bu da uygulanmadı.
+
+### F. Adaptive n_max — yapılmadı, ROI yüksek (gelecek iş)
+
+Yaratıcı %25 acc prompt'larda SD efektif 0.98× (kayıp). Adaptive ile `acc/round < 0.5` görünce
+n→1 veya SD-off yap. Worst case 1× garanti, best case mevcut 2.6×.
+
+LOC: ~30. **Tier 1'in başarısızlığından sonra en pragmatik bir sonraki iş.**
+
+---
+
+## 7.7 Git commit ilerleyişi
+
+```
+3b32d89 first commit                              ← only-needed-files baz iskelet
+933afd0 tool,agent loop, speculative decoding     ← SD port + chat + tool (Aşama 2+3)
+8bb9fb4 bug fix                                   ← 3 bug fix (cache exhaustion + prefill + gen=0)
+cf9d17f hızlandırma                               ← Graph rebuild fix (bucketed cap + mask)
+                                                    → E2B 57→114 t/s, E4B 30→74 t/s = 2.25-2.63×
+d5ecbf1 deneme                                    ← Faz 1 incremental upload denemesi (geri alındı)
+```
+
+Şu an working tree = `cf9d17f hızlandırma` (en iyi sonuç).
+
+---
+
 ## 8. Bilinen sınırlamalar / out of scope
 
 1. **Sadece gemma-4 hedefli.** Diğer model'lerin chat template'leri için legacy hand-coded
