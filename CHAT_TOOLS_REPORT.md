@@ -523,26 +523,26 @@ stdout sadece model çıktısı (token stream).
 │  ┌──────────────────────────────────────────────────────────┐ │
 │  │ HOP LOOP (max 4):                                        │ │
 │  │ ┌──────────────────────────────────────────────────────┐ │ │
-│  │ │ apply_template(model, history, add_ass=true)        │ │ │
-│  │ │   → llama_chat_apply_template (C API, llama.cpp)    │ │ │
-│  │ │   → llm_chat_detect_template (gemma-4 detected)     │ │ │
-│  │ │   → llm_chat_apply_template (gemma-4 branch)        │ │ │
-│  │ │   → "<bos><|turn>system\n<|think|>\n…<|tool>…       │ │ │
-│  │ │       <tool|>…<turn|>\n<|turn>user\n…<turn|>\n      │ │ │
-│  │ │       <|turn>model\n"                               │ │ │
+│  │ │ apply_template(model, history, add_ass=true)         │ │ │
+│  │ │   → llama_chat_apply_template (C API, llama.cpp)     │ │ │
+│  │ │   → llm_chat_detect_template (gemma-4 detected)      │ │ │
+│  │ │   → llm_chat_apply_template (gemma-4 branch)         │ │ │
+│  │ │   → "<bos><|turn>system\n<|think|>\n…<|tool>…        │ │ │
+│  │ │       <tool|>…<turn|>\n<|turn>user\n…<turn|>\n       │ │ │
+│  │ │       <|turn>model\n"                                │ │ │
 │  │ └──────────────────────────────────────────────────────┘ │ │
 │  │             │                                            │ │
 │  │             v                                            │ │
 │  │ ┌──────────────────────────────────────────────────────┐ │ │
-│  │ │ Tail tokenize + decode in n_batch chunks            │ │ │
-│  │ │ (KV cache reused from previous turns)               │ │ │
+│  │ │ Tail tokenize + decode in n_batch chunks             │ │ │
+│  │ │ (KV cache reused from previous turns)                │ │ │
 │  │ └──────────────────────────────────────────────────────┘ │ │
 │  │             │                                            │ │
 │  │             v                                            │ │
 │  │ ┌──────────────────────────────────────────────────────┐ │ │
 │  │ │ Sample loop (greedy):                                │ │ │
-│  │ │   stream piece to stdout                            │ │ │
-│  │ │   if EOG or <turn|> or <tool_call|>: break          │ │ │
+│  │ │   stream piece to stdout                             │ │ │
+│  │ │   if EOG or <turn|> or <tool_call|>: break           │ │ │
 │  │ └──────────────────────────────────────────────────────┘ │ │
 │  │             │                                            │ │
 │  │             v                                            │ │
@@ -550,17 +550,17 @@ stdout sadece model çıktısı (token stream).
 │  │ │ parse_tool_call(assistant_text)                      │ │ │
 │  │ └──────────┬──────────────────────┬────────────────────┘ │ │
 │  │            │ no match             │ matched (name, args) │ │
-│  │            v                      v                       │ │
-│  │ ┌──────────────────┐  ┌──────────────────────────────────┐│ │
-│  │ │ strip_thinking   │  │ extract_path_arg → path          ││ │
-│  │ │ push("assistant")│  │ tool_read_file / tool_list_dir   ││ │
-│  │ │ break hop loop   │  │   (realpath check vs --root)     ││ │
-│  │ └──────────────────┘  │ push("assistant", raw)           ││ │
-│  │                       │ push("tool", NAME{result})       ││ │
-│  │                       │ continue hop loop                ││ │
-│  │                       └──────────────────────────────────┘│ │
+│  │            v                      v                      │ │
+│  │ ┌──────────────────┐  ┌─────────────────────────────────┐│ │
+│  │ │ strip_thinking   │  │ extract_path_arg → path         ││ │
+│  │ │ push("assistant")│  │ tool_read_file / tool_list_dir  ││ │
+│  │ │ break hop loop   │  │   (realpath check vs --root)    ││ │
+│  │ └──────────────────┘  │ push("assistant", raw)          ││ │
+│  │                       │ push("tool", NAME{result})      ││ │
+│  │                       │ continue hop loop               ││ │
+│  │                       └─────────────────────────────────┘│ │
 │  └──────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────-───┘
 ```
 
 ---

@@ -623,6 +623,201 @@ LOC: ~30. **Tier 1'in başarısızlığından sonra en pragmatik bir sonraki iş
 
 ---
 
+## 7.8 Aktif yol haritası — sonraki 3 iş (planlandı, kodlanmadı)
+
+3× hedefine ulaşma yolunda 3 net hedeflenmiş geliştirme. Sırasıyla `6 → 3 → 1` önerilir (kazanç
+artar, risk de artar). 6 ve 3 additive — birlikte +%15-17 yapar. 1 (async) tek başına +%50
+potansiyel ama risk yüksek.
+
+---
+
+### TODO-A — Centroid head GPU-side (önerilen ilk iş)
+
+**Mevcut sorun:**
+Her draft step sonrası host'ta `masked_argmax`:
+- `llama_get_logits_ith` ile dense logits GPU→CPU transfer (~262K × 4 = 1 MB) ~0.5 ms
+- 262K vocab scan ile token_to_cluster lookup ~0.3-0.5 ms
+- Per draft step ~1 ms, 5 draft × 5 ms/round = round'un %10'u
+
+**Çözüm:** Argmax'i GPU'da hesapla, sadece tek `int32 best_token_id` host'a iner.
+
+İki seçenek:
+
+**A1. ggml ops kompozisyonu (portable, +50 LOC daha):**
+```cpp
+// graph build sırasında:
+auto centroid_top_k_idx = ggml_top_k(centroid_logits, /*k=*/32);
+// token_to_cluster ters lookup: cluster_id'leri token id'ye genişlet
+// (precomputed lookup table tensor olarak upload edilir, ggml_get_rows)
+auto sel_token_ids = ggml_get_rows(cluster_to_tokens_table, centroid_top_k_idx);  // [32×128, 1]
+auto sel_logits   = ggml_get_rows(dense_logits, sel_token_ids);                    // [4096, 1]
+auto best_local   = ggml_argmax(sel_logits);                                       // [1]
+auto best_global  = ggml_get_rows(sel_token_ids, best_local);                      // [1] = token id
+res->t_argmax = best_global;  // host bu tek int32'i okur
+```
+
+`cluster_to_tokens_table` = `token_ordering` reshape edilmiş hali, halihazırda yüklü.
+
+**A2. Custom Metal kernel (+30 LOC shader + ~80 LOC C++ wrapper):**
+Daha az ggml op, daha hızlı ama Metal'e özel (CUDA için ayrı yazılır).
+
+**Beklenen etki:**
+- E4B yapısal %99 acc: 74 → ~80 t/s (+%8)
+- E2B yapısal: 114 → ~120 t/s (+%5)
+- Yaratıcı %25 acc: marjinal (5 draft step zaten az)
+
+**LOC:** ~80-150 (A1 portable, A2 Metal-specific)
+**Risk:** Orta — ggml top_k + get_rows + argmax compose; F32/F16 dispatch dikkati gerek.
+**Süre:** 1-2 gün geliştirme + test
+
+**Değişen dosyalar:**
+- `src/models/gemma4_assistant.cpp` (graph build sonuna argmax compose)
+- `src/llama-graph.h` (res->t_argmax çıktısı)
+- `examples/chat/chat.cpp` ve `examples/spec/spec.cpp` (`llama_get_logits_ith` yerine yeni
+  accessor `llama_get_assistant_argmax`)
+- `src/llama-context.cpp` (argmax tap host buffer)
+
+---
+
+### TODO-B — Tier 3 GPU-persistent K/V buffer (additive after A)
+
+**Mevcut sorun:**
+`set_input` her round'da TÜM acc K/V'yi GPU'ya re-upload eder (~3-5 MB):
+- 4 ayrı `ggml_backend_tensor_set` çağrısı (K_full, V_full, K_swa, V_swa)
+- + 2 mask upload
+- Toplam 6 sync call, ~3-5 ms/round CPU-side overhead
+
+Faz 1'de "incremental delta" denedim (sadece yeni byte'lar) ama ggml-alloc'un input
+tensor'larını yer değiştirebilmesi ve call sayısının artması yüzünden başarısız oldu.
+
+**Çözüm:** K/V buffer'ı ggml-alloc kontrolünden çıkar:
+
+```cpp
+// llama_context member
+ggml_backend_buffer_t persistent_kv_buf;     // bizim sahibimiz, ggml-alloc dokunmaz
+
+// init (bir kerelik):
+const size_t kv_bytes = max_bucket * (head_dim_full*nhkv*2 + head_dim_swa*nhkv*2) * sizeof(float);
+persistent_kv_buf = ggml_backend_buft_alloc_buffer(buft, kv_bytes);
+
+// graph input artık VIEW:
+inp->k_full = ggml_view_tensor(ctx, persistent_kv_buf, offset=0, shape=[hd_full, nhkv, n_ctx]);
+// ggml-alloc buna dokunmaz — view of external buffer
+
+// set_input (her round):
+const int64_t prev = prev_n_kv_full_uploaded;
+const int64_t now  = akv->n_kv_full;
+if (now > prev) {
+    // sadece yeni token'ların byte'larını upload
+    const size_t off   = prev * stride * sizeof(float);
+    const size_t bytes = (now - prev) * stride * sizeof(float);
+    ggml_backend_tensor_set(inp->k_full, akv->k_full.data() + prev*stride, off, bytes);
+}
+prev_n_kv_full_uploaded = now;
+```
+
+GPU buffer **kalıcı** — eski pozisyonlar dokunulmaz, sadece yeni yazılır. Bucket büyürse
+buffer realloc (session başına ~5 kez, ucuz).
+
+**Faz 1'den fark:** Faz 1'de ggml-alloc managed buffer'a delta yapmaya çalıştık → buffer
+adresi değişebildiği için her bucket grow'da full re-upload zorunlu kaldı + per-call
+overhead arttı. Tier 3'te buffer **bizim**, adres sabit → gerçek append-only.
+
+**Beklenen etki:**
+- E4B yapısal %99 acc: 80 (TODO-A sonrası) → ~85 t/s (+%6)
+- E2B yapısal: 120 → ~123 t/s (+%3)
+- Yaratıcı: marjinal (~+1 t/s)
+
+**TODO-A + TODO-B birlikte:** E4B 74 → ~85 t/s (+%15) → **3× hedefine %95 yakınlık**.
+
+**LOC:** ~150
+**Risk:** Orta-yüksek — ggml view tensor + scheduler external buffer etkileşim nuanslı.
+"External tensor view" semantic ggml dökümantasyonunda kısmi.
+**Süre:** 2-3 gün + bol test
+
+**Değişen dosyalar:**
+- `src/llama-context.{h,cpp}` (persistent_kv_buf member, init, destructor cleanup)
+- `src/llama-graph.{h,cpp}` (build_inp_assistant_kv view-based; set_input delta upload)
+- Bucket grow path (persistent buffer realloc)
+
+---
+
+### TODO-C — Async draft/verify pipeline (big bet, 3×'i geçer)
+
+**Mevcut sorun:**
+Round sequential — draft ve verify peş peşe:
+
+```
+Round N:   [draft 9ms][verify 35ms][tap 3ms][accept 1ms]   total 48ms
+Round N+1: bekler...     [draft 9ms][verify 35ms]...        total 48ms
+```
+
+Target verify CPU'yu meşgul etmiyor — sadece Metal'de hesaplanıyor. Bu süre boyunca CPU
+boş, draft GPU üzerinde başlayabilir.
+
+**Çözüm:** Round N+1'in draft'ını round N'in verify'ı sırasında speculative başlat.
+
+```
+Time →
+Round N:   [draft────][verify──────────────][tap][accept]
+Round N+1:            [draft────][verify──────────────]...
+                      ↑ speculative start
+```
+
+Round N+1 draft'ı round N'in **draft sonuçlarının kabul edileceğini** varsayar (acc'a o
+draftleri commit gibi davranır). Verify döndüğünde:
+- Hepsi kabul → speculative draft doğru taban → kullan
+- Bir kısmı reddedildi → draft tabanı yanlış → atıp baştan başla
+
+**Yüksek-acc'ta (yapısal görev) speculative tahmin neredeyse hep doğru** → her round overlap
+fayda → effective round time = max(draft, verify) = ~35ms = **+%50 hız**.
+
+**Düşük-acc'ta (yaratıcı) tahmin sık yanlış** → atılan iş → net ~0 veya hafif zarar. Adaptive
+n ile birlikte kullanılırsa düşük-acc'ta SD-off oldukça async path zaten devre dışı.
+
+**Beklenen etki:**
+- E4B yapısal %99 acc: 85 (A+B sonrası) → ~110-120 t/s (+%30) → **3.9× baseline**
+- E4B yapısal %60 acc: +%15
+- Yaratıcı %25 acc: ~0 (Adaptive n ile SD-off zaten)
+
+**Karmaşıklık:**
+1. **İki context concurrent decode** — `llama_decode` sync API; ya `std::thread` ile ayrı
+   thread'lerde, ya da ggml-sched'in `_async` varyantlarıyla aynı thread'den 2 graph'ı paralel
+   submit + sonda sync.
+2. **Speculative state rollback** — round N+1 draft'ı yanlış tabandaysa draft ctx KV'sini
+   manuel rollback (rejected positions'ı seq_rm).
+3. **Atılan iş tracking** — wasted draft sayısını stats'ta göster.
+4. **Metal command queue** — iki context'in command buffer'ları interleave; Metal scheduler
+   genelde halleder ama GPU contention ihtimali.
+
+**LOC:** ~200
+**Risk:** Çok yüksek — multi-thread sync hataları sessizdir, debug çok zor. Race condition
+sample-level bozulmaya yol açabilir (lossless garantisi tehlikede).
+**Süre:** Hafta+ geliştirme + dikkatli test (golden trace ile lossless doğrulama)
+
+**Değişen dosyalar:**
+- `examples/chat/chat.cpp` ve `examples/spec/spec.cpp` (REPL loop double-buffer hale geldi)
+- Yeni helper: speculative draft launcher + rollback
+- llama-context (eğer concurrent decode için flag/lock gerekirse)
+
+**Önkoşul:** TODO-A + TODO-B yapılmış olsa daha iyi (round overhead düşmüş olur, async kazancı
+saf draft+verify üzerine binsin).
+
+---
+
+### Özet tablo
+
+| Sıra | İş | Kazanç (E4B yapısal) | LOC | Risk | Süre |
+|------|----|---------------------:|----:|------|------|
+| **1** | TODO-A: Centroid head GPU | 74→80 t/s (+%8) | 80-150 | Orta | 1-2 gün |
+| **2** | TODO-B: GPU-persistent K/V | 80→85 t/s (+%6) | 150 | Orta-yüksek | 2-3 gün |
+| **3** | TODO-C: Async pipeline | 85→110-120 t/s (+%30) | 200 | Çok yüksek | Hafta+ |
+
+**A+B birlikte: ~%15 kazanç, ~%95 3× hedefine.**
+**A+B+C birlikte: ~%50 kazanç, 3.9× baseline (3× hedefini geçer).**
+
+---
+
 ## 7.7 Git commit ilerleyişi
 
 ```
