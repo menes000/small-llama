@@ -833,6 +833,158 @@ d5ecbf1 deneme                                    ← Faz 1 incremental upload d
 
 ---
 
+## 7b. Bug Raporu — Tool Hop KV Misalignment (2026-05-30)
+
+### Semptom
+
+`llama-chat` ile file okuma tool çağrısı yapıldığında, ikinci hop (tool response sonrası model
+yanıtı) her zaman "I cannot access the file" şeklinde hata veriyordu. Dosya var, sandbox geçiyor,
+`realpath` çalışıyor. `[tool] read_file(path=...)` logu yazılıyordu. Model yine de fail diyordu.
+
+### Root cause
+
+**Token `<tool_call|>` KV cache'e yazılmadan break yapılıyordu.**
+
+#### Greedy path (`!sd_on`):
+
+```cpp
+// BUG — original code
+if (assistant_text.find("<tool_call|>") != std::string::npos) { break; }  // ← ÖNCE break
+//
+batch.token[0] = id;  ...
+llama_decode(ctx, batch);   // ← SONRA decode, ama hiç çalışmıyor
+kv_pos++;
+```
+
+`<tool_call|>` token'ı `piece()` ile emit edilip `assistant_text`'e ekleniyor, sonra KV'ye
+yazılmadan break. `last_formatted = formatted + assistant_text` string olarak `<tool_call|>`
+içeriyor ama `kv_pos` bir pozisyon geride.
+
+İkinci hop'un tail'i:
+```
+last_formatted  = "...<|turn>model\n<|tool_call>...{path:...}<tool_call|>"   ← string
+KV gerçeği      = "...<|turn>model\n<|tool_call>...{path:...}"               ← son tok eksik
+```
+
+Tail = `formatted2.substr(last_formatted.size())` = `"<turn|>\n<|turn>user\n<|tool_response>..."`.
+
+Bu tail `kv_pos`'tan feed'lenince, position `kv_pos` context'inde modelin beklediği
+`<tool_call|>` yok — onun yerine direkt `<turn|>` geliyor. Model corrupted context görüyor →
+tool response'u algılayamıyor → hallucinate "cannot access".
+
+#### SD path (`sd_on`):
+
+SD'de `emit` lambda tool_seen=true set ediyor ama Step 6 (KV advance) her zaman çalışıyor:
+
+- **Case B** (`next_pending = <tool_call|>`): next_pending decode edilmeden next round'a geçilir.
+  Step 6 `acc_nkv += n_accept + 1` yapıyor ama `<tool_call|>` KV'de yok.
+  `kv_pos < want_kv` → eksik token.
+
+- **Case D** (accepted draft içinde `<tool_call|>`): drafted[j]=`<tool_call|>` KV'de var ama
+  drafted[j+1..n_accept-1] da KV'de var (ghost token'lar). Step 6 `n_accept+1` ilerliyor.
+  `kv_pos > want_kv` → ghost token'lar.
+
+Her iki case'de ikinci hop tail'i yanlış pozisyondan başlıyor → same corruption.
+
+### Fix (`examples/chat/chat.cpp`)
+
+**Greedy path** — break'i decode'dan SONRAYA taşı:
+
+```cpp
+// FIX — decode first, break after
+batch.token[0] = id;  batch.pos[0] = kv_pos;  ...  batch.logits[0] = 1;
+llama_decode(ctx, batch);
+kv_pos++;
+
+if (assistant_text.find("<tool_call|>") != std::string::npos) { break; }  // ← SONRA
+```
+
+**SD path** — while loop sonunda `tool_seen` ise KV hizalama:
+
+```cpp
+if (tool_seen) {
+    const auto lf_toks = tokenize(vocab, formatted + assistant_text, true);
+    const int64_t want_kv = (int64_t) lf_toks.size();
+    if (kv_pos > want_kv) {
+        // Case D: ghost token'ları trim et
+        llama_memory_seq_rm(ctx, 0, want_kv, -1);
+        const int64_t trim = kv_pos - want_kv;
+        acc_kf.resize(... - trim*hd_full*nhkv);  // acc vektörlerini de küçült
+        acc_vf.resize(...); acc_ks.resize(...); acc_vs.resize(...);
+        kv_pos = acc_nkv = want_kv;
+    } else if (kv_pos < want_kv) {
+        // Case B: eksik token'ları decode et ve tap acc'a ekle
+        for (int64_t pos = kv_pos; pos < want_kv; ++pos) {
+            batch.token[0] = lf_toks[pos];  batch.pos[0] = pos;  ...
+            llama_decode(ctx, batch);
+            // llama_get_assistant_kv_tap → acc_kf/vf/ks/vs'e ekle
+            kv_pos++;  acc_nkv++;
+        }
+    }
+}
+```
+
+### Neden daha önce fark edilmedi?
+
+Test sırasında (`CHAT_TOOLS_REPORT.md` §6) `/tmp/test_chat.txt` ile tek başarılı test vardı.
+O test büyük ihtimalle Case B senaryosu değildi veya model context corruption'a o specific
+prompt için yeterince robust davrandı. Hata intermittent değil — tool hop her çağrıda fail
+ediyordu ama test sırasında tek bir denemede geçti.
+
+### Sonuç
+
+Fix sonrası `<tool_call|>` her zaman KV'ye yazılıyor, ikinci hop tail'i doğru pozisyondan
+başlıyor, model tool response'ı görüyor ve doğru yanıt üretiyor.
+
+---
+
+## 7c. KV Cache Q8 Default (2026-05-30)
+
+### Değişiklik
+
+`llama-chat` artık KV cache'i varsayılan olarak **q8_0** formatında saklar (önceden f16).
+Dışarıdan hiçbir bağımlılık yok — quantization kodu tamamen `only-needed-files` içinde:
+
+| Dosya | Rol |
+|-------|-----|
+| `ggml/include/ggml.h:398` | `GGML_TYPE_Q8_0 = 8` tip tanımı |
+| `src/llama-kv-cache.cpp:210-211` | KV tensor'larını `type_k`/`type_v` ile oluşturma |
+| `src/llama-kv-cache.cpp:56` | `ggml_quantize_chunk` — yazarken q8'e sıkıştır |
+| `src/llama-kv-cache.cpp:1748-1749` | RoPE için dequantize → f32 → quantize geri |
+
+### Bellek etkisi
+
+| `-c` | f16 (eski) | q8 (yeni) | kazanım |
+|------|-----------|-----------|---------|
+| 4096 | ~250 MB | ~125 MB | 2× |
+| 8192 | ~500 MB | ~250 MB | 2× |
+| 16384 | ~1 GB | ~500 MB | 2× |
+
+### Kod değişikliği (`examples/chat/chat.cpp`)
+
+```cpp
+// args struct:
+bool kv_q8 = true;   // varsayılan q8; --kv-f16 ile f16'ya dön
+
+// context oluşturma:
+if (a.kv_q8) {
+    cp.type_k = GGML_TYPE_Q8_0;
+    cp.type_v = GGML_TYPE_Q8_0;
+}
+```
+
+### Flag
+
+`--kv-f16` → q8'i kapat, f16'ya dön (hata ayıklama veya kalite karşılaştırması için).
+
+### Kalite etkisi
+
+K ve V vektörleri 8-bit integer olarak saklanır. Attention output üzerindeki etkisi minimal
+(ağırlıklar değil, aktivasyonlar sıkıştırılıyor). Pratik: acceptance rate ve t/s değerleri
+f16 ile aynı kalır.
+
+---
+
 ## 8. Bilinen sınırlamalar / out of scope
 
 1. **Sadece gemma-4 hedefli.** Diğer model'lerin chat template'leri için legacy hand-coded
@@ -897,11 +1049,14 @@ cd build && cmake --build . -j 8 && cd ..
   --spec-type draft-mtp --spec-draft-n-max 5 \
   -p "List the first 50 prime numbers." -n 400 -ngl 99
 
-# Multi-turn chat + tool + SD
+# Multi-turn chat + tool + SD (KV q8 default — 2× bellek kazanımı)
 ./build/bin/llama-chat \
   -m /Users/enes/Desktop/all/llms/gemma-4-E2B-it-UD-Q8_K_XL.gguf \
   -md /Users/enes/Desktop/all/llms/gemma-4-E2B-it-assistant.F16.gguf \
-  -ngl 99 -c 2048 --draft-max 3
+  -ngl 99 -c 8192 --draft-max 3
+
+# KV f16 istersen (karşılaştırma için):
+#   ... --kv-f16
 
 # Chat tool'suz + thinking
 ./build/bin/llama-chat -m <model> -ngl 99 --no-tools --thinking

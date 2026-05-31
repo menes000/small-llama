@@ -31,6 +31,7 @@
 #include <string>
 #include <vector>
 #include <fstream>
+#include <deque>
 #include <sstream>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -49,6 +50,7 @@ struct args {
     bool no_tools     = false;
     bool no_sd        = false;      // force SD off even if -md given
     bool yolo         = false;      // skip per-tool approval (auto-allow all)
+    bool kv_q8        = true;       // K/V cache stored as q8_0 by default; --kv-f16 reverts
     std::string root  = "";
 };
 
@@ -56,7 +58,7 @@ static void usage(const char * a0) {
     fprintf(stderr,
         "\nusage:\n  %s -m <model.gguf> [-md <draft.gguf>] [-n N] [--draft-max N]\n"
         "              [-ngl N] [-c N] [-b N] [--thinking] [--no-tools] [--no-sd]\n"
-        "              [--root <dir>]\n\n", a0);
+        "              [--kv-f16] [--root <dir>]\n\n", a0);
 }
 
 static bool parse_args(int argc, char ** argv, args & a) {
@@ -77,6 +79,7 @@ static bool parse_args(int argc, char ** argv, args & a) {
         else if (s == "--no-tools")   { a.no_tools = true; }
         else if (s == "--no-sd")      { a.no_sd    = true; }
         else if (s == "--yolo")       { a.yolo     = true; }
+        else if (s == "--kv-f16")     { a.kv_q8   = false; }
         else if (s == "--root")       { auto v = next("--root");       if (!v) return false; a.root         = v; }
         else if (s == "-h" || s == "--help") { usage(argv[0]); return false; }
         else { fprintf(stderr, "unknown arg: %s\n", s.c_str()); usage(argv[0]); return false; }
@@ -339,6 +342,10 @@ int main(int argc, char ** argv) {
     cp.n_ctx   = a.n_ctx;
     cp.n_batch = a.n_batch;
     cp.no_perf = true;
+    if (a.kv_q8) {
+        cp.type_k = GGML_TYPE_Q8_0;
+        cp.type_v = GGML_TYPE_Q8_0;
+    }
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "failed to create context\n"); return 1; }
 
@@ -391,7 +398,7 @@ int main(int argc, char ** argv) {
 
     // history (system message is constructed once, contains tools/thinking markers)
     const std::string system_text = build_system_content(!a.no_tools, a.thinking);
-    std::vector<std::string>          msg_storage;
+    std::deque<std::string>           msg_storage;  // deque: push_back never invalidates existing c_str() pointers
     std::vector<llama_chat_message>   msgs;
     auto push_msg = [&](const std::string & role, const std::string & content) {
         msg_storage.push_back(role);
@@ -528,8 +535,6 @@ int main(int argc, char ** argv) {
                 std::cout.flush();
                 turn_emitted++;
 
-                if (assistant_text.find("<tool_call|>") != std::string::npos) { break; }
-
                 batch.n_tokens     = 1;
                 batch.token[0]     = id;
                 batch.pos[0]       = kv_pos;
@@ -538,6 +543,8 @@ int main(int argc, char ** argv) {
                 batch.logits[0]    = 1;
                 if (llama_decode(ctx, batch) != 0) { fprintf(stderr, "[chat] decode failed\n"); return false; }
                 kv_pos++;
+
+                if (assistant_text.find("<tool_call|>") != std::string::npos) { break; }
             }
         } else {
             // === SPECULATIVE DECODING PATH ===
@@ -653,6 +660,51 @@ int main(int argc, char ** argv) {
                 kv_pos  += (int) n_keep;
                 std::memcpy(pending_feat.data(), hid + (n_keep - 1) * n_embd_back, n_embd_back * sizeof(float));
                 pending_tok = next_pending;
+            }
+
+            // KV alignment after tool_seen: the emitted <tool_call|> token may not be in the
+            // target KV (Case B: it was `next_pending`, never decoded) or the KV may have ghost
+            // tokens after it (Case D: accepted drafts past <tool_call|> were also decoded).
+            // Recompute the correct KV depth from the actual emitted text and fix both cases.
+            if (tool_seen) {
+                const std::string lf   = formatted + assistant_text;
+                const auto lf_toks     = tokenize(vocab, lf, /*add_special=*/true);
+                const int64_t want_kv  = (int64_t) lf_toks.size();
+                if (kv_pos > want_kv) {
+                    // Ghost tokens: trim target KV and acc vectors
+                    llama_memory_seq_rm(llama_get_memory(ctx), 0, (llama_pos) want_kv, -1);
+                    const int64_t trim = kv_pos - want_kv;
+                    if (nhkv > 0 && hd_full > 0 && hd_swa > 0) {
+                        acc_kf.resize(acc_kf.size() - (size_t)(trim * hd_full * nhkv));
+                        acc_vf.resize(acc_vf.size() - (size_t)(trim * hd_full * nhkv));
+                        acc_ks.resize(acc_ks.size() - (size_t)(trim * hd_swa  * nhkv));
+                        acc_vs.resize(acc_vs.size() - (size_t)(trim * hd_swa  * nhkv));
+                    }
+                    kv_pos = acc_nkv = want_kv;
+                } else if (kv_pos < want_kv) {
+                    // Missing tokens: decode them and accumulate their K/V tap
+                    for (int64_t pos = kv_pos; pos < want_kv; ++pos) {
+                        batch.n_tokens     = 1;
+                        batch.token[0]     = lf_toks[pos];
+                        batch.pos[0]       = (llama_pos) pos;
+                        batch.n_seq_id[0]  = 1;
+                        batch.seq_id[0][0] = 0;
+                        batch.logits[0]    = 0;
+                        if (llama_decode(ctx, batch) != 0) { return false; }
+                        if (nhkv > 0 && hd_full > 0 && hd_swa > 0) {
+                            const float *kf2=nullptr,*vf2=nullptr,*ks2=nullptr,*vs2=nullptr,*hid2=nullptr;
+                            int64_t n2 = llama_get_assistant_kv_tap(ctx, &kf2,&vf2,&ks2,&vs2,&hid2, nullptr,nullptr,nullptr);
+                            if (n2 == 1 && kf2) {
+                                acc_kf.insert(acc_kf.end(), kf2, kf2 + hd_full * nhkv);
+                                acc_vf.insert(acc_vf.end(), vf2, vf2 + hd_full * nhkv);
+                                acc_ks.insert(acc_ks.end(), ks2, ks2 + hd_swa  * nhkv);
+                                acc_vs.insert(acc_vs.end(), vs2, vs2 + hd_swa  * nhkv);
+                                acc_nkv++;
+                            }
+                        }
+                        kv_pos++;
+                    }
+                }
             }
         }
 
