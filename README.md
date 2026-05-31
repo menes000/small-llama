@@ -1,61 +1,132 @@
-# Minimal llama.cpp — okuma için
+# Minimal llama.cpp — Gemma 4 Speculative Decoding
 
-Bu klasör llama.cpp'nin **terminal'den tek bir GGUF modelle text üretmek için
-gereken en az kod**ı içerir. Server, multimodal, common util, vendor (httplib/json/stb),
-GPU backend'leri (CUDA/Vulkan/SYCL...), Python conversion script'leri, doc/test/bench
-yok. Sadece okuyup anlamak için.
+![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey)
+![Language](https://img.shields.io/badge/language-C%2B%2B17-blue)
+![Backend](https://img.shields.io/badge/backend-Metal%20%7C%20CPU%20NEON-orange)
+![Status](https://img.shields.io/badge/output-lossless-brightgreen)
+
+llama.cpp'nin Gemma 4 ile çalışmak için gereken **en az kodu**. Server, multimodal, vendor (httplib/json/stb), Python script, doc/test/bench yok. Okuyup anlamak ve deney yapmak için.
+
+**Full tree:** ~500 MB — **Bu tree:** ~55 MB
+
+---
+
+## Özellikler
+
+- **Speculative decoding (SD):** Gemma 4 E4B-it Q8 üzerinde **1.69× speedup** (M2 Pro, lossless)
+- **Saguaro SSD:** arXiv [2603.03251](https://arxiv.org/abs/2603.03251) implementasyonu — geometric fan-out cache + async overlap
+- **Multi-turn chat REPL:** Gemma 4 chat template, `read_file` / `list_dir` sandboxed tool'ları
+- **CPU draft + Metal target:** draft CPU NEON, target Metal GPU — ayrı backend paralel overlap
+- **Lossless:** verify her zaman target dağılımını garantiler, output token-identical
+
+---
+
+## Performans (M2 Pro, Gemma 4 E4B-it Q8)
+
+| Prompt | Baseline | SD (CPU draft) | Speedup |
+|---|---|---|---|
+| primes (40 prime) | ~30 t/s | 54.3 t/s | **1.81×** |
+| count (1–60) | ~30 t/s | 29.1 t/s | ~1× |
+| counting task (acc %85) | ~30 t/s | 49.8 t/s | **1.69×** |
+
+Draft: `gemma-4-E4B-it-assistant.Q8_0.gguf` (96 MB EAGLE/MTP head). Output her testte byte-identical.
+
+---
+
+## Gereksinimler
+
+- macOS + Apple Silicon (M1/M2/M3) — Metal backend için
+- CMake 3.21+
+- Xcode Command Line Tools
+- GGUF model dosyaları (aşağıda)
+
+---
 
 ## Yapı
 
 ```
 include/              libllama public API (llama.h, llama-cpp.h)
 src/                  libllama core (model load, KV cache, sampler, tokenizer)
-  models/             her LLM mimarisi için forward graph (gemma, llama, qwen, ...)
-ggml/                 tensor library
+  models/
+    gemma4.cpp                Gemma 4 target forward graph
+    gemma4_assistant.cpp      Gemma 4 EAGLE/MTP draft head
+ggml/
   include/            ggml.h, ggml-alloc.h, ggml-backend.h, gguf.h
-  src/                core tensor ops + quantization + GGUF reader
+  src/
     ggml-cpu/         CPU backend (ARM NEON, x86 SIMD)
     ggml-metal/       Apple Silicon GPU backend (.metal shader + dispatch)
-examples/simple/      ENTRY POINT — 223 satır, sadece llama.h kullanır
+examples/
+  simple/             ENTRY POINT — 223 satır, sadece llama.h kullanır
+  chat/               Multi-turn REPL + tool use + opsiyonel SD
+  spec/               Speculative decoding benchmark (SD + Saguaro SSD)
+docs/
+  guides/             HOW_TO_RUN.md, USAGE.md
+  chat/               Chat örnek raporları
+  speculative-decoding/  SD/SSD benchmark sonuçları
+  handoff/            Oturum handoff'ları ve master rapor
 cmake/                build helper modülleri
-CMakeLists.txt        bu klasördeki kendi minimal build script'i
+CMakeLists.txt
 ```
 
-Toplam ~10 MB. Orijinal fork ~500 MB.
+---
 
 ## Build
 
 ```bash
-cd /Users/enes/Desktop/all/attention/only-needed-files
+cd /Users/enes/Desktop/all/less-llama-cpp/only-needed-files
 cmake -B build
 cmake --build build -j 8
 ```
 
-Çıktı: `./build/bin/llama-simple` ve `./build/bin/libllama.dylib`, `libggml*.dylib`.
+Çıktı: `./build/bin/llama-simple`, `llama-chat`, `llama-spec` + `libllama.dylib`, `libggml*.dylib`
+
+---
 
 ## Çalıştır
 
 ```bash
-./build/bin/llama-simple -m /Users/enes/Desktop/all/llms/Gemma-4-E4B-Uncensored-Q6.gguf -n 64 "Merhaba"
+# Tek prompt
+./build/bin/llama-simple \
+  -m /Users/enes/Desktop/all/llms/gemma-4-E4B-it-Q8_0.gguf \
+  -n 64 "Merhaba"
+
+# Interaktif chat (multi-turn, tool use, opsiyonel SD)
+./build/bin/llama-chat \
+  -m /Users/enes/Desktop/all/llms/gemma-4-E4B-it-Q8_0.gguf \
+  -md /Users/enes/Desktop/all/llms/gemma-4-E4B-it-assistant.Q8_0.gguf
+
+# Speculative decoding benchmark
+./build/bin/llama-spec \
+  -m /Users/enes/Desktop/all/llms/gemma-4-E4B-it-Q8_0.gguf \
+  -md /Users/enes/Desktop/all/llms/gemma-4-E4B-it-assistant.Q8_0.gguf \
+  -p "Count from 1 to 60:" -n 128
 ```
 
-## Okuma sırası (yeni başlayan için)
+Tüm flag'ler ve default değerler: [`docs/guides/USAGE.md`](docs/guides/USAGE.md)
 
-1. **`include/llama.h`** — Public API surface. Burada ne fonksiyonlar var, ne yapıyorlar.
-2. **`examples/simple/simple.cpp`** — API'nin nasıl kullanıldığını gör. 223 satır, baştan sona oku. Buradan diğer dosyalara nasıl atladığını gözle.
-3. **`src/llama.cpp`** — `llama_init_from_model`, `llama_decode`, ana orchestration.
-4. **`src/llama-model.cpp`** + **`llama-model-loader.cpp`** — GGUF dosyasından model nasıl yükleniyor.
-5. **`src/llama-vocab.cpp`** — Tokenize / detokenize. SentencePiece, BPE, vb.
-6. **`src/llama-context.cpp`** + **`llama-kv-cache.cpp`** — KV cache, attention state yönetimi.
-7. **`src/llama-sampler.cpp`** — Sampling pipeline (greedy, top-k, top-p, temperature).
-8. **`src/llama-graph.cpp`** — Compute graph oluşturma (attention + FFN + norm).
-9. **`src/models/gemma3.cpp`** (veya istediğin mimari) — O modelin forward pass'i nasıl.
-10. **`ggml/include/ggml.h`** + **`ggml/src/ggml.c`** — Tensor library. matmul, softmax, rope, vb.
-11. **`ggml/src/ggml-metal/`** — Apple GPU dispatch + `.metal` shader dosyaları.
-12. **`ggml/src/ggml-quants.c`** — Q4/Q6/Q8 dequantization (Gemma Q6_K nasıl float'a açılıyor).
+---
+
+## Okuma Sırası (yeni başlayan için)
+
+| # | Dosya | Ne öğrenirsin |
+|---|---|---|
+| 1 | `include/llama.h` | Public API surface |
+| 2 | `examples/simple/simple.cpp` | API nasıl kullanılır (223 satır) |
+| 3 | `src/llama.cpp` | `llama_init_from_model`, `llama_decode` orchestration |
+| 4 | `src/llama-model.cpp` + `llama-model-loader.cpp` | GGUF → model yükleme |
+| 5 | `src/llama-vocab.cpp` | Tokenizer (BPE, SentencePiece) |
+| 6 | `src/llama-context.cpp` + `llama-kv-cache.cpp` | KV cache, attention state |
+| 7 | `src/llama-sampler.cpp` | Sampling (greedy, top-k, top-p, temp) |
+| 8 | `src/llama-graph.cpp` | Compute graph (attention + FFN + norm) |
+| 9 | `src/models/gemma4.cpp` | Gemma 4 forward pass |
+| 10 | `ggml/include/ggml.h` + `ggml/src/ggml.c` | Tensor library (matmul, rope, softmax) |
+| 11 | `ggml/src/ggml-metal/` | Apple GPU dispatch + `.metal` shader'lar |
+| 12 | `ggml/src/ggml-quants.c` | Q4/Q6/Q8 dequantization |
+
+---
 
 ## Notlar
 
-- `src/CMakeLists.txt` `models/*.cpp` GLOB ile bütün mimarileri pull ediyor. Tek mimari (Gemma) istiyorsan src/models/ içindeki diğer .cpp'leri silebilirsin — sonra `cmake -B build` yenile.
-- `ggml-cpu/` çok büyük (1+ MB) çünkü her CPU arch için ayrı SIMD kernel var (arm64 NEON, x86 AVX2/AVX512, vb). Sadece M-series için sade tutmak istersen ARM-only patch lazım.
-- Mimari listesini görmek: `ls src/models/` — ~80 model variant.
+- `src/CMakeLists.txt` `models/*.cpp` GLOB ile pull ediyor. Şu an sadece `gemma4.cpp` + `gemma4_assistant.cpp` var.
+- `ggml-cpu/` büyük (1+ MB) — her CPU arch için ayrı SIMD kernel (ARM NEON, x86 AVX2/AVX512). Sadece M-series için ARM-only patch lazım.
+- SD/SSD tasarımı ve benchmark detayları: [`docs/speculative-decoding/`](docs/speculative-decoding/) ve [`docs/handoff/MASTER_REPORT.md`](docs/handoff/MASTER_REPORT.md)
