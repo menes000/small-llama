@@ -938,7 +938,72 @@ başlıyor, model tool response'ı görüyor ve doğru yanıt üretiyor.
 
 ---
 
-## 7c. KV Cache Q8 Default (2026-05-30)
+## 7c. Bug Raporu — msg_storage Dangling Pointer (2026-05-31)
+
+### Semptom
+
+`llama-chat` her 3. turn'de (bazen 2. turn sonunda) çöküyordu:
+
+```
+[chat] empty tail tokenization
+[chat] decode failed during turn -> resetting (system only); next prompt starts fresh
+```
+
+İlk 2 turn normal, 3. turn'de hiçbir çıktı yok.
+
+### Root cause
+
+`push_msg` her çağrıda `msg_storage` vector'una 2 element ekliyor (role + content), sonra bu
+elementlerin `c_str()` pointer'larını `msgs` vector'una yazıyor:
+
+```cpp
+std::vector<std::string> msg_storage;   // BUG: vector realloc pointer'ları invalidate eder
+...
+msg_storage.push_back(role);
+msg_storage.push_back(content);
+const char * r = msg_storage[...].c_str();   // bu pointer kaydediliyor
+const char * c = msg_storage[...].c_str();   // bu da
+msgs.push_back({ r, c });                    // msgs içinde saklanıyor
+```
+
+`std::vector` kapasitesi dolduğunda tüm elemanları yeni belleğe MOVE eder. Move sonrası
+eski `c_str()` pointer'ları dangling kalır. Capacity doubling sırası:
+
+```
+push #1-2  → capacity: 2
+push #3-4  → realloc 2→4   → msgs[0] dangling
+push #5-8  → realloc 4→8   → msgs[0..1] dangling
+push #9    → realloc 8→16  → msgs[0..3] dangling  ← 3. turn'deki crash buradan
+```
+
+9. element push'u turn 2'nin assistant cevabı push'unda gerçekleşiyor. Ardından `apply_template`
+dangling pointer'ları okuyunca `formatted` string yanlış uzunlukta ya da içeriksiz çıkıyor.
+Sonuç: `formatted.size() <= last_formatted.size()` → `tail = ""` → `tail_tokens.empty()` → hata.
+
+### Fix
+
+`std::vector` → `std::deque`. `deque::push_back` mevcut elementlere pointer/reference'ları
+**hiçbir zaman invalidate etmez** (sadece iterator'ları eder). `c_str()` pointer'ları güvende kalır.
+
+```cpp
+// ÖNCE (bug):
+std::vector<std::string> msg_storage;
+
+// SONRA (fix):
+std::deque<std::string>  msg_storage;  // push_back never invalidates existing c_str() pointers
+```
+
+`#include <deque>` eklendi. API aynı — başka kod değişmedi.
+
+### Neden geç fark edildi
+
+İlk testler tek-shot veya 1-2 turn'deydi; bug turn 3'te tetikleniyordu. Reset sonrası "next prompt
+starts fresh" mesajı çalışıyordu çünkü reset_chat msg_storage'ı `clear()` + yeniden dolduruyordu
+(fresh pointer'larla) — yani reset her seferinde bug'ı geçici olarak "gizliyordu."
+
+---
+
+## 7d. KV Cache Q8 Default (2026-05-30)
 
 ### Değişiklik
 
