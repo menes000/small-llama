@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <future>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -38,18 +39,37 @@ struct args {
     std::string model_target;
     std::string model_draft;
     std::string prompt = "hello";
-    int  n_predict     = 128;
-    int  n_gpu_layers  = 99;
-    int  n_draft_max   = 5;
-    int  n_ctx         = 4096;
-    int  n_batch       = 2048;
-    bool apply_chat    = true;
+    int  n_predict         = 128;
+    int  n_gpu_layers       = 99;   // target ngl
+    int  n_gpu_layers_draft = 0;    // draft ngl (default CPU — enables true paral. with --ssd-async)
+    int  n_draft_max       = 5;
+    int  n_ctx             = 4096;
+    int  n_batch           = 2048;
+    bool apply_chat        = true;
+
+    // SSD (Speculative Speculative Decoding, arXiv 2603.03251v3) options.
+    // ssd_fan_out = total budget B across draft positions (Thm 12). B=1 disables SSD.
+    int   ssd_fan_out  = 1;
+    float ssd_r        = 1.0f;   // power-law exponent for geometric fan-out
+    float ssd_C        = 1.0f;   // Saguaro sampling downweight (effective only under non-greedy)
+    bool  ssd_async    = false;  // overlap target verify with SSD post-pass via std::thread
 };
 
 static void print_usage(const char * argv0) {
     fprintf(stderr,
         "\nusage:\n  %s -m <target.gguf> -md <draft.gguf> [-p <prompt>] [-n N] "
-        "[--draft-max N] [-ngl N] [-c N] [-b N] [--no-chat]\n\n", argv0);
+        "[--draft-max N] [-ngl N] [-ngl-draft N] [-c N] [-b N] [--no-chat]\n"
+        "       [--ssd-fan-out B] [--ssd-r R] [--ssd-sampling-C C] [--ssd-async]\n\n"
+        "Backend split:\n"
+        "  -ngl N        target GPU layers (default 99 = full Metal)\n"
+        "  -ngl-draft N  draft  GPU layers (default 0 = CPU NEON; required for --ssd-async)\n\n"
+        "SSD options (paper arXiv 2603.03251v3):\n"
+        "  --ssd-fan-out B    total fan-out budget across draft positions (default 1 = SSD off)\n"
+        "  --ssd-r R          power-law exponent for geometric fan-out (default 1.0)\n"
+        "  --ssd-sampling-C C Saguaro sampling downweight (default 1.0 = off; greedy mode warns)\n"
+        "  --ssd-async        overlap target verify with SSD post-pass via std::thread\n"
+        "                     (only helpful when draft+target are on different backends)\n\n",
+        argv0);
 }
 
 static bool parse_args(int argc, char ** argv, args & a) {
@@ -65,9 +85,14 @@ static bool parse_args(int argc, char ** argv, args & a) {
         else if (s == "-n")  { auto v = need("-n");  if (!v) return false; a.n_predict = atoi(v); }
         else if (s == "--draft-max") { auto v = need("--draft-max"); if (!v) return false; a.n_draft_max = atoi(v); }
         else if (s == "-ngl") { auto v = need("-ngl"); if (!v) return false; a.n_gpu_layers = atoi(v); }
+        else if (s == "-ngl-draft" || s == "--ngl-draft") { auto v = need("-ngl-draft"); if (!v) return false; a.n_gpu_layers_draft = atoi(v); }
         else if (s == "-c")   { auto v = need("-c");   if (!v) return false; a.n_ctx   = atoi(v); }
         else if (s == "-b")   { auto v = need("-b");   if (!v) return false; a.n_batch = atoi(v); }
         else if (s == "--no-chat") { a.apply_chat = false; }
+        else if (s == "--ssd-fan-out") { auto v = need("--ssd-fan-out"); if (!v) return false; a.ssd_fan_out = atoi(v); }
+        else if (s == "--ssd-r")        { auto v = need("--ssd-r");        if (!v) return false; a.ssd_r        = (float) atof(v); }
+        else if (s == "--ssd-sampling-C") { auto v = need("--ssd-sampling-C"); if (!v) return false; a.ssd_C = (float) atof(v); }
+        else if (s == "--ssd-async") { a.ssd_async = true; }
         else if (s == "-h" || s == "--help") { print_usage(argv[0]); return false; }
         else { fprintf(stderr, "unknown arg: %s\n", s.c_str()); print_usage(argv[0]); return false; }
     }
@@ -102,14 +127,18 @@ static void emit_token(const llama_vocab * vocab, llama_token id) {
     fflush(stdout);
 }
 
-// Pick the masked argmax: top-k clusters of centroid_logits → restrict dense logits
-// to the tokens of those clusters → argmax.
+// Pick the top-F masked tokens: top-k clusters of centroid_logits → restrict dense logits
+// to the tokens of those clusters → return the F highest-logit tokens (out_tokens[0] = argmax).
 // Mathematically equivalent to the reference Gemma4AssistantMaskedEmbedder head,
 // since per-token logit = hidden . embedding in both.
-static llama_token masked_argmax(
+static int masked_topf(
         const float * dense_logits, int n_vocab,
         const float * centroid_logits, int n_centroids, int top_k,
-        const std::vector<int32_t> & token_to_cluster) {
+        const std::vector<int32_t> & token_to_cluster,
+        int F, std::vector<llama_token> & out_tokens) {
+    out_tokens.clear();
+    if (F <= 0) { return 0; }
+
     std::vector<int> idx(n_centroids);
     std::iota(idx.begin(), idx.end(), 0);
     const int k = std::min(top_k, n_centroids);
@@ -118,13 +147,61 @@ static llama_token masked_argmax(
     std::vector<uint8_t> sel(n_centroids, 0);
     for (int i = 0; i < k; ++i) { sel[idx[i]] = 1; }
 
-    llama_token best = -1;
-    float bv = -INFINITY;
+    // Gather allowed (token, logit) pairs then partial_sort by logit desc.
+    std::vector<std::pair<float, llama_token>> cand;
+    cand.reserve(n_vocab / 4);
     for (int v = 0; v < n_vocab; ++v) {
         if (!sel[token_to_cluster[v]]) { continue; }
-        if (dense_logits[v] > bv) { bv = dense_logits[v]; best = v; }
+        cand.emplace_back(dense_logits[v], (llama_token) v);
     }
-    return best;
+    const int take = std::min(F, (int) cand.size());
+    std::partial_sort(cand.begin(), cand.begin() + take, cand.end(),
+            [](const std::pair<float, llama_token> & a, const std::pair<float, llama_token> & b) {
+                return a.first > b.first;
+            });
+    out_tokens.reserve(take);
+    for (int i = 0; i < take; ++i) { out_tokens.push_back(cand[i].second); }
+    return take;
+}
+
+// Single-best wrapper (preserves the original call sites).
+static llama_token masked_argmax(
+        const float * dense_logits, int n_vocab,
+        const float * centroid_logits, int n_centroids, int top_k,
+        const std::vector<int32_t> & token_to_cluster) {
+    std::vector<llama_token> out;
+    int got = masked_topf(dense_logits, n_vocab, centroid_logits, n_centroids, top_k, token_to_cluster, 1, out);
+    return got > 0 ? out[0] : -1;
+}
+
+// Geometric fan-out (Saguaro Thm 12): split a budget B across positions k in [0,K),
+// with F_k roughly proportional to a_p^(k/(1+r)). Each F_k >= 1, sum(F_k) <= B.
+// Returns vector of size K. If B <= K, returns all-ones (no headroom for alternatives).
+static std::vector<int> geometric_fanout(int B, int K, float a_p, float r) {
+    std::vector<int> F(K, 1);
+    if (B <= K || K <= 0) { return F; }
+    a_p = std::max(0.05f, std::min(0.99f, a_p));
+    r   = std::max(0.0f, r);
+
+    // Raw geometric weights w_k = a_p^(k/(1+r)). Pick F_0 so sum(round(F_0 * w_k)) ~= B.
+    std::vector<double> w(K);
+    double wsum = 0.0;
+    for (int k = 0; k < K; ++k) {
+        w[k] = std::pow((double) a_p, (double) k / (1.0 + (double) r));
+        wsum += w[k];
+    }
+    const double F0 = (double) B / wsum;
+    int used = 0;
+    for (int k = 0; k < K; ++k) {
+        int fk = std::max(1, (int) std::lround(F0 * w[k]));
+        F[k] = fk;
+        used += fk;
+    }
+    // Trim from the tail (smallest positions in the geometric) until under budget.
+    for (int k = K - 1; k >= 0 && used > B; --k) {
+        while (F[k] > 1 && used > B) { F[k]--; used--; }
+    }
+    return F;
 }
 
 // Greedy argmax over a dense logit vector.
@@ -137,19 +214,35 @@ static llama_token greedy(const float * logits, int n_vocab) {
     return best;
 }
 
+// Quiet log callback: drop GGML_LOG_LEVEL_DEBUG noise (MTP draft prints "calling encode()"
+// on every decode otherwise — looks like a crash). Anything INFO and above still prints.
+static void spec_quiet_log(enum ggml_log_level level, const char * text, void * /*user_data*/) {
+    if (level <= GGML_LOG_LEVEL_DEBUG) { return; }
+    fputs(text, stderr);
+}
+
 int main(int argc, char ** argv) {
     args a;
     if (!parse_args(argc, argv, a)) { return 1; }
 
+    llama_log_set(spec_quiet_log, nullptr);
     ggml_backend_load_all();
 
     // ---- load models ----
-    llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = a.n_gpu_layers;
+    // Per-model GPU layer config: target stays on Metal, draft can be CPU (default 0).
+    // CPU-side draft enables real verify/spec overlap under --ssd-async.
+    llama_model_params mp_tgt = llama_model_default_params();
+    mp_tgt.n_gpu_layers = a.n_gpu_layers;
+    llama_model_params mp_drf = llama_model_default_params();
+    mp_drf.n_gpu_layers = a.n_gpu_layers_draft;
 
-    llama_model * tgt = llama_model_load_from_file(a.model_target.c_str(), mp);
+    fprintf(stderr, "[spec] backends: target ngl=%d (%s)   draft ngl=%d (%s)\n",
+            a.n_gpu_layers,       a.n_gpu_layers       > 0 ? "GPU" : "CPU",
+            a.n_gpu_layers_draft, a.n_gpu_layers_draft > 0 ? "GPU" : "CPU");
+
+    llama_model * tgt = llama_model_load_from_file(a.model_target.c_str(), mp_tgt);
     if (!tgt) { fprintf(stderr, "failed to load target model: %s\n", a.model_target.c_str()); return 1; }
-    llama_model * drf = llama_model_load_from_file(a.model_draft.c_str(),  mp);
+    llama_model * drf = llama_model_load_from_file(a.model_draft.c_str(),  mp_drf);
     if (!drf) { fprintf(stderr, "failed to load draft model:  %s\n",  a.model_draft.c_str()); return 1; }
 
     const llama_vocab * vocab = llama_model_get_vocab(tgt);
@@ -215,6 +308,15 @@ int main(int argc, char ** argv) {
 
     fprintf(stderr, "[spec] prompt tokens=%zu n_predict=%d n_draft_max=%d n_centroids=%d top_k=%d backbone=%lld\n",
             input.size(), a.n_predict, a.n_draft_max, n_centroids, top_k, (long long) n_embd_back);
+
+    // SSD config sanity (paper arXiv 2603.03251v3).
+    const bool ssd_enabled = a.ssd_fan_out > a.n_draft_max;
+    fprintf(stderr, "[spec] SSD: fan_out_budget=%d r=%.2f sampling_C=%.2f -> %s\n",
+            a.ssd_fan_out, a.ssd_r, a.ssd_C,
+            ssd_enabled ? "ON (cache built per round)" : "OFF (budget <= K, no alternatives)");
+    if (a.ssd_C < 1.0f) {
+        fprintf(stderr, "[spec] WARN: --ssd-sampling-C<1 has no effect under greedy decoding (current mode is greedy).\n");
+    }
 
     // ---- prefill: decode the prompt on the target, capture tap ----
     llama_batch batch_t = llama_batch_init(a.n_batch, 0, 1);
@@ -283,6 +385,29 @@ int main(int argc, char ** argv) {
     std::vector<float> concat(2 * n_embd_back);
     std::vector<float> cur_feat(n_embd_back);
 
+    // ---- SSD state (Speculative Speculative Decoding) ----
+    // spec_cache[k] holds up to (F_k - 1) "what if bonus at draft pos k = alt" entries,
+    // each with a pre-speculated next draft token + its chained feature for round T+1.
+    struct cache_entry {
+        llama_token alt_bonus;
+        llama_token next_tok;
+        std::vector<float> next_feat;
+    };
+    std::vector<std::vector<cache_entry>> spec_cache;
+
+    // Carry-over seed when a cache hit lets us skip round T+1's first draft decode.
+    bool ssd_have_seed = false;
+    llama_token ssd_seed_tok = 0;
+    std::vector<float> ssd_seed_feat(n_embd_back);
+
+    // Stats.
+    int64_t ssd_hits = 0, ssd_misses = 0;
+    int64_t ssd_extra_decodes = 0;
+    int64_t ssd_steps_saved   = 0;
+    int64_t verify_wall_us    = 0;   // total wall-time spent in target verify decodes
+    int64_t post_pass_wall_us = 0;   // total wall-time spent in SSD post-pass alt decodes
+    int64_t overlap_wall_us   = 0;   // total wall-time of the verify/post-pass parallel region
+
     bool eog = llama_vocab_is_eog(vocab, pending_tok);
 
     const int64_t t_gen_start = ggml_time_us();
@@ -306,46 +431,159 @@ int main(int argc, char ** argv) {
         std::vector<llama_token> drafted;
         drafted.reserve(a.n_draft_max);
 
-        for (int i = 0; i < a.n_draft_max; ++i) {
-            // build the concat row: scaled embedding + hidden
-            llama_model_get_token_embd(tgt, cur_tok, concat.data());
-            for (int j = 0; j < n_embd_back; ++j) { concat[j] *= embed_scale; }
-            std::memcpy(concat.data() + n_embd_back, cur_feat.data(), n_embd_back * sizeof(float));
+        // Reset per-round speculation cache.
+        spec_cache.assign(a.n_draft_max, {});
 
+        // Estimate running primary acceptance rate for fan-out shaping (Thm 12).
+        const float a_p_est = (n_rounds > 0 && total_drafted > 0)
+            ? (float) total_accepted / (float) total_drafted
+            : 0.8f;
+        const std::vector<int> fanout = geometric_fanout(a.ssd_fan_out, a.n_draft_max, a_p_est, a.ssd_r);
+
+        // SSD cache hit from previous round? Skip first draft decode and seed from cache.
+        int start_k = 0;
+        if (ssd_have_seed) {
+            drafted.push_back(ssd_seed_tok);
+            cur_tok = ssd_seed_tok;
+            std::memcpy(cur_feat.data(), ssd_seed_feat.data(), n_embd_back * sizeof(float));
+            ssd_steps_saved++;
+            start_k = 1;
+            ssd_have_seed = false;
+        }
+
+        // Scratch for top-F lookup.
+        std::vector<llama_token> topF;
+
+        auto build_concat_for = [&](llama_token tok, const std::vector<float> & feat) {
+            llama_model_get_token_embd(tgt, tok, concat.data());
+            for (int j = 0; j < n_embd_back; ++j) { concat[j] *= embed_scale; }
+            std::memcpy(concat.data() + n_embd_back, feat.data(), n_embd_back * sizeof(float));
+        };
+
+        auto decode_draft_one = [&]() -> bool {
             batch_d.n_tokens     = 1;
             std::memcpy(batch_d.embd, concat.data(), concat.size() * sizeof(float));
             batch_d.pos[0]       = draft_pos;
             batch_d.n_seq_id[0]  = 1;
             batch_d.seq_id[0][0] = 0;
             batch_d.logits[0]    = 1;
+            return llama_decode(ctx_d, batch_d) == 0;
+        };
 
-            if (llama_decode(ctx_d, batch_d) != 0) { fprintf(stderr, "draft decode failed\n"); goto done; }
+        // Per-step state we need to replay alt decodes AFTER the greedy chain completes.
+        // (Interleaving alt decodes with greedy steps pollutes draft K/V at draft_pos and
+        //  noticeably drops acceptance.)
+        struct step_state { llama_token in_tok; std::vector<float> in_feat; std::vector<llama_token> alts; };
+        std::vector<step_state> steps;
+        steps.reserve(a.n_draft_max);
+
+        for (int k = start_k; k < a.n_draft_max; ++k) {
+            // Snapshot the INPUT for this step before greedy advances state.
+            step_state st;
+            st.in_tok = cur_tok;
+            st.in_feat.assign(cur_feat.begin(), cur_feat.end());
+
+            // ---- main greedy step ----
+            build_concat_for(cur_tok, cur_feat);
+            if (!decode_draft_one()) { fprintf(stderr, "draft decode failed\n"); goto done; }
 
             const float * lg  = llama_get_logits_ith    (ctx_d, 0);
             const float * emb = llama_get_embeddings_ith(ctx_d, 0); // [backbone + n_centroids]
             if (!lg || !emb) { break; }
 
-            // masked-embedding head: argmax dense logits restricted to top-k centroid clusters
-            llama_token id = masked_argmax(lg, n_vocab, emb + n_embd_back, n_centroids, top_k, token_to_cluster);
-            if (id < 0) { break; }
-
+            const int F_k = fanout[k];
+            llama_token id;
+            if (F_k > 1) {
+                masked_topf(lg, n_vocab, emb + n_embd_back, n_centroids, top_k, token_to_cluster, F_k, topF);
+                if (topF.empty()) { break; }
+                id = topF[0];
+                // Record the non-greedy alternatives for the post-pass.
+                for (size_t i = 1; i < topF.size(); ++i) {
+                    if (topF[i] != id) { st.alts.push_back(topF[i]); }
+                }
+            } else {
+                id = masked_argmax(lg, n_vocab, emb + n_embd_back, n_centroids, top_k, token_to_cluster);
+                if (id < 0) { break; }
+            }
             drafted.push_back(id);
 
-            // chain: next step's hidden = this step's post-projection feature
+            // chain main loop: next step's hidden = this step's post-projection feature
             std::memcpy(cur_feat.data(), emb, n_embd_back * sizeof(float));
             cur_tok = id;
+            steps.push_back(std::move(st));
         }
         total_drafted += (int) drafted.size();
         n_rounds++;
 
-        // -------- VERIFY: target decodes [pending_tok, d_1, ..., d_N] --------
-        // build the target batch starting at position acc_nkv
+        // -------- Build VERIFY batch first so post-pass/verify can run in either order/parallel.
         batch_t.n_tokens = 0;
         push_token_batch(pending_tok, (llama_pos) acc_nkv, /*logits=*/true);
         for (size_t i = 0; i < drafted.size(); ++i) {
             push_token_batch(drafted[i], (llama_pos) (acc_nkv + 1 + (llama_pos) i), /*logits=*/true);
         }
-        if (llama_decode(ctx_t, batch_t) != 0) { fprintf(stderr, "verify decode failed\n"); break; }
+
+        // ---- SSD post-pass body (lambda). Mutates ctx_d, batch_d, spec_cache, concat,
+        //      ssd_extra_decodes. Does NOT touch ctx_t / batch_t. Safe to run concurrently
+        //      with target verify (different context, different backend).
+        auto run_post_pass = [&]() -> int64_t {
+            const int64_t t0 = ggml_time_us();
+            bool need_restore = false;
+            for (size_t kk = 0; kk < steps.size(); ++kk) {
+                const auto & st = steps[kk];
+                for (llama_token alt : st.alts) {
+                    build_concat_for(alt, st.in_feat);
+                    if (!decode_draft_one()) { goto post_pass_done; }
+                    const float * alt_lg  = llama_get_logits_ith    (ctx_d, 0);
+                    const float * alt_emb = llama_get_embeddings_ith(ctx_d, 0);
+                    if (!alt_lg || !alt_emb) { goto post_pass_done; }
+                    llama_token alt_next = masked_argmax(alt_lg, n_vocab, alt_emb + n_embd_back,
+                                                          n_centroids, top_k, token_to_cluster);
+                    if (alt_next < 0) { goto post_pass_done; }
+                    const int gk = start_k + (int) kk;
+                    cache_entry e;
+                    e.alt_bonus = alt;
+                    e.next_tok  = alt_next;
+                    e.next_feat.assign(alt_emb, alt_emb + n_embd_back);
+                    spec_cache[gk].push_back(std::move(e));
+                    ssd_extra_decodes++;
+                    need_restore = true;
+                }
+            }
+            // Restore K/V at draft_pos to match vanilla path (greedy's last step).
+            if (need_restore && !steps.empty()) {
+                const auto & last = steps.back();
+                build_concat_for(last.in_tok, last.in_feat);
+                if (decode_draft_one()) { ssd_extra_decodes++; }
+            }
+        post_pass_done:
+            return ggml_time_us() - t0;
+        };
+
+        bool need_post_pass = false;
+        for (const auto & s_ : steps) { if (!s_.alts.empty()) { need_post_pass = true; break; } }
+
+        // ---- Dispatch: async overlap vs serial ----
+        const int64_t t_dispatch = ggml_time_us();
+        int verify_rc = 0;
+        if (a.ssd_async && need_post_pass) {
+            // Verify on Metal, post-pass on draft backend (CPU) — true parallel.
+            std::future<int> verify_fut = std::async(std::launch::async, [&]() {
+                const int64_t t0 = ggml_time_us();
+                int rc = llama_decode(ctx_t, batch_t);
+                verify_wall_us += (ggml_time_us() - t0);
+                return rc;
+            });
+            post_pass_wall_us += run_post_pass();
+            verify_rc = verify_fut.get();
+        } else {
+            // Serial path: post-pass then verify (preserves prior behavior).
+            if (need_post_pass) { post_pass_wall_us += run_post_pass(); }
+            const int64_t t0 = ggml_time_us();
+            verify_rc = llama_decode(ctx_t, batch_t);
+            verify_wall_us += (ggml_time_us() - t0);
+        }
+        overlap_wall_us += (ggml_time_us() - t_dispatch);
+        if (verify_rc != 0) { fprintf(stderr, "verify decode failed\n"); break; }
 
         // grab the tap for this batch (will be appended fresh — context.cpp resets tap on
         // each decode that starts with n_tokens_prev==0, which is our case here)
@@ -416,6 +654,25 @@ int main(int argc, char ** argv) {
         // (this is what predicts next_pending). pending_tok = next_pending.
         std::memcpy(pending_feat.data(), hid + (n_keep - 1) * n_embd_back, n_embd_back * sizeof(float));
         pending_tok = next_pending;
+
+        // ---- SSD cache lookup ----
+        // If the bonus token matches one of the speculation-cache alternatives at the
+        // accept position, seed round T+1 with the pre-speculated next draft token + feature.
+        // This skips the first draft decode of the next round (saves ~1 step on hit).
+        if (a.ssd_fan_out > a.n_draft_max && n_accept < (int) spec_cache.size()) {
+            bool hit = false;
+            for (const auto & e : spec_cache[n_accept]) {
+                if (e.alt_bonus == next_pending) {
+                    ssd_seed_tok = e.next_tok;
+                    std::memcpy(ssd_seed_feat.data(), e.next_feat.data(), n_embd_back * sizeof(float));
+                    ssd_have_seed = true;
+                    ssd_hits++;
+                    hit = true;
+                    break;
+                }
+            }
+            if (!hit) { ssd_misses++; }
+        }
     }
 
 done:
@@ -427,6 +684,24 @@ done:
             n_rounds, total_drafted, total_accepted,
             total_drafted ? 100.0 * (double) total_accepted / (double) total_drafted : 0.0,
             n_rounds ? (double) total_accepted / (double) n_rounds : 0.0);
+
+    {
+        const int64_t ssd_attempts = ssd_hits + ssd_misses;
+        fprintf(stderr, "[spec] SSD: hits=%lld misses=%lld hit_rate=%.1f%% extra_draft_decodes=%lld steps_saved=%lld net_extra=%lld\n",
+                (long long) ssd_hits, (long long) ssd_misses,
+                ssd_attempts ? 100.0 * (double) ssd_hits / (double) ssd_attempts : 0.0,
+                (long long) ssd_extra_decodes, (long long) ssd_steps_saved,
+                (long long) (ssd_extra_decodes - ssd_steps_saved));
+        const double v_ms = verify_wall_us    / 1000.0;
+        const double p_ms = post_pass_wall_us / 1000.0;
+        const double o_ms = overlap_wall_us   / 1000.0;
+        const double hidden_pct = (v_ms + p_ms > 0)
+            ? 100.0 * ((v_ms + p_ms) - o_ms) / (v_ms + p_ms) : 0.0;
+        fprintf(stderr, "[spec] timing: verify=%.0fms post_pass=%.0fms overlap_region=%.0fms hidden=%.1f%%   async=%s draft_backend=%s\n",
+                v_ms, p_ms, o_ms, hidden_pct,
+                a.ssd_async ? "on" : "off",
+                a.n_gpu_layers_draft > 0 ? "GPU" : "CPU");
+    }
 
     llama_batch_free(batch_t);
     llama_batch_free(batch_d);
