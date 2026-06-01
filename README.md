@@ -125,6 +125,14 @@ All flags and defaults: [`docs/guides/USAGE.md`](docs/guides/USAGE.md)
 
 ---
 
+## References
+
+- **Speculative Decoding** — Leviathan et al., 2022 — [arXiv 2211.17192](https://arxiv.org/abs/2211.17192)
+- **EAGLE** — Li et al., 2024 — [arXiv 2401.15077](https://arxiv.org/abs/2401.15077)
+- **Saguaro SSD** — Kumar, Dao, May, 2025 — [arXiv 2603.03251](https://arxiv.org/abs/2603.03251)
+
+---
+
 ## Notes
 
 - `src/CMakeLists.txt` pulls `models/*.cpp` via GLOB. Currently only `gemma4.cpp` + `gemma4_assistant.cpp`.
