@@ -1,27 +1,27 @@
-# E4B Q8 Çifti — SD vs SSD Karşılaştırma
+# E4B Q8 Pair — SD vs SSD Comparison
 
 ## Setup
 
 - **Target**: `gemma-4-E4B-it-Q8_0.gguf` (7.6 GB)
 - **Draft**:  `gemma-4-E4B-it-assistant.Q8_0.gguf` (96 MB)
-- **Donanım**: M2 Pro
+- **Hardware**: M2 Pro
 - **Draft-max**: 5, **SSD fan-out**: 7
 
-## Bug Fix Notu
+## Bug Fix Note
 
-İlk denemede ekrana sürekli `decode: cannot decode batches with this context (calling encode() instead)` basıyordu. Crash değil, GGML_LOG_LEVEL_DEBUG seviyesi her draft decode'da uyarı basıyordu (MTP context normal). Çözüm: `spec.cpp main()` başına quiet log callback eklendi — DEBUG seviyesi suppress, INFO ve üzeri görünür.
+Initial runs printed `decode: cannot decode batches with this context (calling encode() instead)` repeatedly. Not a crash — GGML_LOG_LEVEL_DEBUG was printing a warning on every draft decode (normal for MTP context). Fix: quiet log callback added at start of `spec.cpp main()` — DEBUG level suppressed, INFO and above visible.
 
 ```cpp
 static void spec_quiet_log(enum ggml_log_level level, const char * text, void *) {
     if (level <= GGML_LOG_LEVEL_DEBUG) return;
     fputs(text, stderr);
 }
-// main() içinde: llama_log_set(spec_quiet_log, nullptr);
+// in main(): llama_log_set(spec_quiet_log, nullptr);
 ```
 
-## Sonuç Tablosu
+## Results Table
 
-Output 16 çalıştırmada byte-identical (lossless).
+Output byte-identical across 16 runs (lossless).
 
 | Prompt | SD Metal (both GPU) | **SD CPU draft** | SSD serial CPU | SSD ASYNC CPU |
 |---|---|---|---|---|
@@ -29,83 +29,83 @@ Output 16 çalıştırmada byte-identical (lossless).
 | count (1-60) | 26.3 | **29.1** | 27.0 | 28.6 |
 | creative | 20.5 | **23.4** | 21.9 | 23.1 |
 | coding (fib) | 39.8 | **45.6** | 36.0 | 38.1 |
-| **ortalama** | **34.0** | **38.1** | 33.1 | 35.1 |
+| **average** | **34.0** | **38.1** | 33.1 | 35.1 |
 
-## Şu An Full Metal SD'den DAHA İYİ mi DAHA KÖTÜ mü?
+## Is SSD ASYNC Better or Worse Than SD Metal?
 
-### SSD ASYNC vs SD Metal (paper implement vs baseline)
-| Prompt | SSD async | SD Metal | fark |
+### SSD ASYNC vs SD Metal (paper implementation vs baseline)
+| Prompt | SSD async | SD Metal | diff |
 |---|---|---|---|
 | primes | 50.4 | 49.2 | **+2.4%** ✓ |
 | count | 28.6 | 26.3 | **+8.7%** ✓ |
 | creative | 23.1 | 20.5 | **+12.7%** ✓ |
 | coding | 38.1 | 39.8 | -4.3% ✗ |
-| **ortalama** | **35.1** | **34.0** | **+3.2%** ✓ |
+| **average** | **35.1** | **34.0** | **+3.2%** ✓ |
 
-→ **Marjinal kazanç. 4'te 3 prompt'ta daha iyi, 1'de kötü. Ortalama %3 hızlı.**
+→ **Marginal gain. 3 of 4 prompts better, 1 worse. Average +3% faster.**
 
-### Asıl Sürpriz: SD CPU draft >> SD Metal her zaman
-| Prompt | SD CPU | SD Metal | fark |
+### The Real Surprise: SD CPU draft >> SD Metal consistently
+| Prompt | SD CPU | SD Metal | diff |
 |---|---|---|---|
 | primes | 54.3 | 49.2 | **+10.4%** |
 | count | 29.1 | 26.3 | **+10.6%** |
 | creative | 23.4 | 20.5 | **+14.1%** |
 | coding | 45.6 | 39.8 | **+14.6%** |
-| **ortalama** | **38.1** | **34.0** | **+12.0%** |
+| **average** | **38.1** | **34.0** | **+12.0%** |
 
-→ **SSD bile gerekmiyor — sadece draft'ı CPU'ya almak %12 net kazanç.**
+→ **SSD not even needed — just moving draft to CPU gives 12% net gain.**
 
-## Neden SD CPU > SD Metal?
+## Why SD CPU > SD Metal?
 
-E4B target Q8 = **7.6 GB** Metal RAM'de. Draft de Metal'deyken GPU'yu daha çok stress'liyor:
-- Memory bandwidth çekişmesi
+E4B target Q8 = **7.6 GB** in Metal RAM. With draft also on Metal, GPU is more stressed:
+- Memory bandwidth contention
 - Shader pipeline congestion
-- Aynı queue'da seri compute
+- Serial compute in the same queue
 
-Draft CPU'ya çekildiğinde:
-- Target Metal'de tek başına → verify hızlı
-- Draft CPU NEON'da → küçük model (96 MB Q8) zaten hızlı
-- İki backend BAĞIMSIZ çalışıyor
+With draft moved to CPU:
+- Target Metal runs alone → verify faster
+- Draft CPU NEON → small model (96 MB Q8) already fast
+- Two backends run **independently**
 
-E2B'de (4.9 GB target) bu etki yoktu — E2B Metal'de nefes alıyor zaten. Sadece büyük target'larda CPU draft kazanç veriyor.
+On E2B (4.9 GB target) this effect didn't exist — E2B Metal had headroom. Only large targets benefit from CPU draft.
 
-## SSD async neden CPU draft baseline'ı geçmiyor?
+## Why Doesn't SSD Async Beat SD CPU Baseline?
 
 ```
 verify  ~80 ms
-post_pass ~250 ms (B=7 → ~30 alt decode × ~8ms)
+post_pass ~250 ms (B=7 → ~30 alt decodes × ~8ms)
 overlap_region ~265 ms
 hidden = (80+250-265)/(80+250) = 19.7%
 ```
 
-Post-pass verify'dan **3× büyük**. Async sadece verify wall-time'ı gizliyor. Post-pass bottleneck olmaya devam ediyor.
+Post-pass is **3× larger than verify**. Async only hides the verify wall-time. Post-pass remains the bottleneck.
 
-E2B'de hidden %12 idi, E4B'de %20-22'ye çıktı (verify uzadı). **Daha büyük target'ta** SSD async kazanca yaklaşır:
-- M-Ultra veya 70B model gibi target'larda verify >> post-pass olabilir
-- O noktada SSD async > SD CPU mümkün
+E2B hidden was 12%, E4B rises to 20-22% (verify got longer). With a **larger target**:
+- M-Ultra or 70B model where verify >> post-pass becomes possible
+- At that point SSD async > SD CPU is achievable
 
-Şu anki donanımda: SSD async = SD CPU (overhead tam kapanıyor ama net kazanç yok).
+On current hardware: SSD async ≈ SD CPU (overhead fully hidden but no net gain).
 
-## Pratik Tavsiye (E4B Q8 çifti, M2 Pro)
+## Practical Recommendation (E4B Q8 pair, M2 Pro)
 
-| Amaç | Komut |
+| Goal | Command |
 |---|---|
-| **En hızlı** | `-ngl 99 -ngl-draft 0 --ssd-fan-out 1` (SD CPU draft) |
+| **Fastest** | `-ngl 99 -ngl-draft 0 --ssd-fan-out 1` (SD CPU draft) |
 | Paper SSD demo | `-ngl 99 -ngl-draft 0 --ssd-fan-out 7 --ssd-async` |
-| Eski varsayılan | `-ngl 99 -ngl-draft 99` (SD Metal, en yavaş) |
+| Legacy default | `-ngl 99 -ngl-draft 99` (SD Metal, slowest) |
 
-**En önemli öğrenme**: Apple Silicon'da büyük target için **default'u `-ngl-draft 0` yapmak doğru**. Zaten yeni default 0.
+**Key takeaway**: On Apple Silicon with large target, **defaulting to `-ngl-draft 0` is correct**. Already the new default.
 
-## Lossless Doğrulama
+## Lossless Verification
 
-16 çalıştırma (4 prompt × 4 mode). Tüm output'lar byte-identical. Threading deterministik compute'u bozmadı.
+16 runs (4 prompts × 4 modes). All outputs byte-identical. Threading didn't break deterministic compute.
 
-## Sonuç
+## Conclusion
 
-- ✅ SSD async **SD Metal'den %3 hızlı** (ortalama, 4/4 prompt'tan 3'ünde)
-- ✅ SD CPU draft **SD Metal'den %12 hızlı** (her prompt'ta)
-- ✅ SSD async ≈ SD CPU draft (SSD overhead tamamen gizlendi)
-- ✅ Lossless korundu
-- ❌ Paper'ın %30 kazancı yok — M2 Pro'da verify hala post-pass'ten kısa
+- ✅ SSD async **3% faster than SD Metal** (average, 3/4 prompts)
+- ✅ SD CPU draft **12% faster than SD Metal** (every prompt)
+- ✅ SSD async ≈ SD CPU draft (SSD overhead fully hidden)
+- ✅ Lossless preserved
+- ❌ Paper's 30% gain absent — M2 Pro verify still shorter than post-pass
 
-**Net cevap**: Şu anki kurulum (SSD async, E4B Q8, CPU draft) **full Metal SD'den biraz daha iyi (+%3)**. Ama esas kazanç SSD'den değil, draft'ı CPU'ya çekmekten geliyor (+%12). E2B'de SD Metal hâlâ en hızlıydı; E4B'de tersine döndü.
+**Net answer**: Current setup (SSD async, E4B Q8, CPU draft) is **slightly better than full Metal SD (+3%)**. But the real gain comes from moving draft to CPU (+12%), not from SSD. On E2B, SD Metal was still fastest; on E4B, the result flips.

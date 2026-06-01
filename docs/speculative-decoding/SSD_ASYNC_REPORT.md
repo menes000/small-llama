@@ -1,25 +1,25 @@
-# SSD Async (CPU draft + Metal target + std::thread) Raporu
+# SSD Async (CPU draft + Metal target + std::thread) Report
 
-Paper'ın gerçek hız kazancı kurulumu: draft AYRI cihazda, verify ile paralel. Bu sürüm onu Mac üzerinde uygular:
+Paper's true speedup setup: draft on a SEPARATE device, parallel with verify. This version implements it on Mac:
 - **Target**: Metal GPU (`-ngl 99`, default)
-- **Draft**: CPU NEON (`-ngl-draft 0`, yeni default)
-- **Overlap**: `--ssd-async` → SSD post-pass `std::async` ile target verify'a paralel çalışır
+- **Draft**: CPU NEON (`-ngl-draft 0`, new default)
+- **Overlap**: `--ssd-async` → SSD post-pass runs parallel to target verify via `std::async`
 
-Donanım: M2 Pro (Apple Silicon). Target = Gemma4 E2B Q8_K_XL. Draft = Gemma4 E2B assistant F16 (~156 MB).
+Hardware: M2 Pro (Apple Silicon). Target = Gemma4 E2B Q8_K_XL. Draft = Gemma4 E2B assistant F16 (~156 MB).
 
-## Yeni CLI
+## New CLI
 
-| Flag | Default | Açıklama |
+| Flag | Default | Description |
 |---|---|---|
-| `-ngl N` | 99 | Target GPU layer sayısı (Metal) |
-| `-ngl-draft N` | **0** | Draft GPU layer sayısı (0 = CPU NEON) |
-| `--ssd-async` | off | Target verify ile SSD post-pass paralel (true overlap) |
+| `-ngl N` | 99 | Target GPU layers (Metal) |
+| `-ngl-draft N` | **0** | Draft GPU layers (0 = CPU NEON) |
+| `--ssd-async` | off | Parallel SSD post-pass with target verify (true overlap) |
 
-`--ssd-async` ancak draft ve target FARKLI backend'de ise anlamlı.
+`--ssd-async` is only meaningful when draft and target are on DIFFERENT backends.
 
-## Test Sonuçları (K=5, B=7, M2 Pro)
+## Test Results (K=5, B=7, M2 Pro)
 
-Output her testte byte-identical (lossless). 4-way diff = 0 fark.
+Output byte-identical in every test (lossless). 4-way diff = 0 difference.
 
 | Prompt | SD Metal (both GPU) | SD CPU draft | SSD serial CPU | SSD ASYNC CPU | hit% |
 |---|---|---|---|---|---|
@@ -28,84 +28,84 @@ Output her testte byte-identical (lossless). 4-way diff = 0 fark.
 | creative | **40.8** | 36.7 | 30.4 | **35.2** | 16 |
 | coding (fib) | **86.5** | 80.2 | 68.4 | **79.2** | 23 |
 
-### Timing breakdown örneği (creative, async):
+### Timing breakdown example (creative, async):
 ```
-verify = 80 ms     (target Metal, 59 round × ~1.4ms)
+verify = 80 ms     (target Metal, 59 rounds × ~1.4ms)
 post_pass = 514 ms (draft CPU, 153 alt decodes × ~3.3ms)
 overlap_region = 525 ms
 hidden = 11.7%
 ```
 
-## Ana Bulgular
+## Key Findings
 
-### 1. Async overlap işe yarıyor — her zaman serial'den hızlı
-Tüm prompt'larda `ssd_async` > `ssd_serial` (+%12 ortalama). Post-pass cost'unun verify wall-time içinde olan kısmı tamamen gizleniyor.
+### 1. Async overlap works — always faster than serial
+Across all prompts, `ssd_async` > `ssd_serial` (~12% average). The portion of post-pass cost that fits within verify wall-time is fully hidden.
 
 ### 2. SSD async ≈ SD CPU baseline
-Async modu SSD overhead'ini tamamen Metal verify wall-time'ı içinde gizliyor. Sonuç: SSD aktifken bile saf SD-CPU-draft kadar hızlı. **SSD bedavaya geliyor**.
+Async mode hides SSD overhead completely within Metal verify wall-time. Result: even with SSD active, speed equals pure SD CPU draft. **SSD comes for free.**
 
-### 3. Ama SSD async < SD Metal (pure GPU)
-Çünkü:
-- CPU draft kendisi %7 daha yavaş GPU draft'tan (M2 Pro NEON 156MB model için)
-- Bu fixed cost SSD ile bağlantılı değil — CPU backend'in kendisi
-- Async ne kadar iyi olsa de CPU draft tax'ini kaldıramıyor
+### 3. But SSD async < SD Metal (pure GPU)
+Because:
+- CPU draft is itself ~7% slower than GPU draft (M2 Pro NEON for 156MB model)
+- This is a fixed cost unrelated to SSD
+- No amount of async can remove the CPU backend tax
 
-### 4. Hidden% sadece ~%12-13 (post-pass verify'dan çok büyük olduğu için)
+### 4. Hidden% only ~12-13% (post-pass much larger than verify)
 ```
 verify    ~35 ms
-post_pass ~250 ms  (B=7, K=5, ~30 alt decode)
+post_pass ~250 ms  (B=7, K=5, ~30 alt decodes)
 ```
-Verify post-pass'in 1/7'si. Async overlap verify'i tamamen gizliyor ama post-pass yine de bottleneck. Hidden% formülü:
+Verify is 1/7 of post-pass. Async fully hides verify but post-pass remains the bottleneck. Hidden% formula:
 ```
 hidden = (verify + post_pass - max(verify, post_pass)) / (verify + post_pass)
        = verify / (verify + post_pass)
        = 35 / 285 = 12%
 ```
 
-### 5. Lossless korunuyor
-4 prompt × 4 mode = 16 çalıştırma. Her çiftin output'u byte-identical. Threading deterministik compute'u bozmadı.
+### 5. Lossless preserved
+4 prompts × 4 modes = 16 runs. All output pairs byte-identical. Threading didn't break deterministic compute.
 
-## Önemli Çıkarımlar
+## Key Takeaways
 
-### Paper'ın "30% kazanç" iddiası kim için geçerli?
-Paper donanım dengesi:
-- Target: 4×H100 (büyük model, **çok yavaş** verify)
-- Draft: 1×H100 (küçük model, çok hızlı)
-- Verify wall-time >> draft spec wall-time → draft "bedava"
+### When does paper's "30% gain" claim apply?
+Paper hardware balance:
+- Target: 4×H100 (large model, **very slow** verify)
+- Draft: 1×H100 (small model, very fast)
+- Verify wall-time >> draft spec wall-time → draft is "free"
 
-Senin donanımın:
+This hardware:
 - Target: 1× M2 Pro Metal GPU (~30ms verify)
 - Draft CPU: M2 Pro NEON (~3.3ms per single decode, ~250ms post-pass)
-- Verify << post_pass → draft DEĞİL bedava
+- Verify << post_pass → draft is NOT free
 
-### Ne zaman SSD async net kazanç verir?
-`verify_wall_us >= post_pass_wall_us` koşulu sağlandığında. Bunun için:
-- Çok büyük target model (verify yavaşlar)
-- Veya çok küçük alt sayısı (B = K+1 → 1-2 alt, post-pass küçülür)
-- Veya daha hızlı draft backend (örn. NPU varsa)
+### When does SSD async give net gain?
+When `verify_wall_us >= post_pass_wall_us`. This requires:
+- Very large target model (verify becomes slower)
+- Or very few alt decodes (B = K+1 → 1-2 alts, post-pass shrinks)
+- Or faster draft backend (e.g. NPU)
 
-### M2 Pro'da pratik sweet spot
-| Konfigürasyon | t/s | Not |
+### M2 Pro practical sweet spot
+| Configuration | t/s | Note |
 |---|---|---|
-| SD Metal (default) | 108 | En hızlı |
-| SD CPU draft | 98 | %10 yavaş ama RAM/VRAM ayrımı sağlıyor |
-| SSD async CPU | 95 | SD CPU + SSD bedava cache, %12 yavaş |
+| SD Metal (default) | 108 | Fastest |
+| SD CPU draft | 98 | 10% slower but separates RAM/VRAM |
+| SSD async CPU | 95 | SD CPU + free SSD cache, 12% slower |
 
-Pure hız için: SD Metal. SSD demo/research için: SSD async.
+Pure speed: SD Metal. SSD demo/research: SSD async.
 
-## Bilinen Sınırlamalar
+## Known Limitations
 
-1. **CPU draft yavaş**: M2 Pro NEON F16 156MB model için ~300 decode/sec. Daha küçük draft (örn. quantize edilmiş Q4) daha hızlı olur.
+1. **CPU draft slow**: M2 Pro NEON F16 156MB model ~300 decode/sec. Smaller quantized draft (e.g. Q4) would be faster.
 
-2. **`hidden%` mütevazı**: post_pass >> verify olduğu sürece overlap savings sınırlı kalır. Verify wall-time'ı uzatmak ya da post-pass'i kısaltmak gerek.
+2. **hidden% modest**: As long as post_pass >> verify, overlap savings remain limited. Need longer verify wall-time or shorter post-pass.
 
-3. **Thread overhead**: `std::async` setup ~0.1ms. Çok kısa round'larda fark edilmiyor.
+3. **Thread overhead**: `std::async` setup ~0.1ms. Negligible on normal round durations.
 
-4. **Accept rate koruması**: Mevcut restore mekanizması B≤K+2 için iyi çalışıyor. Daha yüksek B'lerde bazı prompt'larda accept rate hala düşebilir (önceki rapor §2.2).
+4. **Accept rate protection**: Current restore mechanism works well for B≤K+2. At higher B some prompts may still see accept rate drop (see §2.2 in SSD_REPORT.md).
 
 ## Future Work
 
-- **Faster draft quantization**: Gemma4 assistant Q4_K_M ~40MB → CPU draft 2-3× hızlanabilir.
-- **Multi-round async pipelining**: Round T+1 greedy chain'ini round T verify'a paralel başlat.
-- **GGML CPU backend tuning**: Accelerate backend'i aktif etmek (CMakeLists'te `GGML_ACCELERATE OFF` → ON).
-- **Test farklı donanım**: M-Ultra'da Metal verify çok daha yavaş, async kazanç büyür.
+- **Faster draft quantization**: Gemma4 assistant Q4_K_M ~40MB → CPU draft 2-3× faster.
+- **Multi-round async pipelining**: Start round T+1 greedy chain parallel to round T verify.
+- **GGML CPU backend tuning**: Enable Accelerate backend (CMakeLists `GGML_ACCELERATE OFF` → ON).
+- **Test different hardware**: M-Ultra has much slower Metal verify, async gains would be larger.

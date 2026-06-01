@@ -1,98 +1,87 @@
-# `only-needed-files` Master Raporu — Gemma 4 Spec Decoding + Chat + Tool Use
+# `only-needed-files` Master Report — Gemma 4 Spec Decoding + Chat + Tool Use
 
-Tarih: 2026-05-26
-Kapsam: Tüm oturum boyunca yapılan iş — bug avı, port, optimizasyon, sınırlamalar, gelecek roadmap.
+Date: 2026-05-26
+Scope: All work done across the full session — bug hunt, port, optimization, limitations, future roadmap.
 
 ---
 
 ## 0. TL;DR
 
-**Yapılanlar:**
-- Full tree llama.cpp'de Gemma-4 speculative decoding'i bozuyordu (acceptance %0, çöp token, Metal crash). 3 root-cause bug bulundu ve fix'lendi → SD çalışır hale geldi (E4B'de 1.69×, E2B yapısal görevde 1.5×).
-- Tüm SD altyapısı `only-needed-files` minimal tree'sine port edildi (~1100 satır).
-- `only-needed-files` için yeni `llama-spec` örneği yazıldı (438 satır).
-- Gemma-4 chat template `only-needed-files`'a eklendi (`llama_chat_apply_template` artık -1 dönmüyor).
-- Yeni `llama-chat` örneği: multi-turn REPL + sandbox'lı `read_file`/`list_dir` tool'ları + opsiyonel SD entegrasyonu + per-turn istatistikler.
+**What was done:**
+- Gemma-4 speculative decoding in the full tree llama.cpp was completely broken (0% acceptance, garbage tokens, Metal crash). 3 root-cause bugs found and fixed → SD working (1.69× on E4B, 1.5× on E2B structured tasks).
+- All SD infrastructure ported to `only-needed-files` minimal tree (~1100 lines).
+- New `llama-spec` example written for `only-needed-files` (438 lines).
+- Gemma-4 chat template added to `only-needed-files` (`llama_chat_apply_template` no longer returns -1).
+- New `llama-chat` example: multi-turn REPL + sandboxed `read_file`/`list_dir` tools + optional SD integration + per-turn stats.
 
-**Performans:**
+**Performance:**
 - E2B baseline: ~51 t/s (Metal)
-- E2B SD (yapısal görev, primes): **80 t/s** spec.cpp / **57 t/s** chat.cpp (acc %79)
+- E2B SD (structured task, primes): **80 t/s** spec.cpp / **57 t/s** chat.cpp (acc 79%)
 - E4B-it Q8 baseline: ~30 t/s
-- E4B-it SD (counting): **49.8 t/s = 1.69×** (acc %85)
+- E4B-it SD (counting): **49.8 t/s = 1.69×** (acc 85%)
 
-**Bilinen sınır:** %85 acceptance bile 3× kazandırmıyor çünkü round-başı sabit overhead (graph rebuild, scheduler sync) E2B gibi küçük modelin baseline'ını aşmıyor. 3×'e ulaşmak için graph-rebuild eliminasyonu, adaptive draft length, daha büyük target gerekir.
+**Known limitation:** Even 85% acceptance doesn't give 3× because per-round fixed overhead (graph rebuild, scheduler sync) exceeds the benefit for small models like E2B. Reaching 3× requires graph-rebuild elimination, adaptive draft length, and a larger target.
 
 ---
 
-## 1. Proje bağlamı
+## 1. Project context
 
-`only-needed-files` (`/Users/enes/Desktop/all/less-llama-cpp/only-needed-files/`) kullanıcının kişisel
-projesi: **llama.cpp'yi mümkün olan en az satırla aynı performansta çalıştırmak**. Full tree
-~500 MB, only-needed-files ~10 MB. Gemma-4 mimarisine odaklı.
+`only-needed-files` (`/Users/enes/Desktop/all/less-llama-cpp/only-needed-files/`) is the user's personal project: **run llama.cpp at equivalent performance with the fewest possible lines**. Full tree ~500 MB, only-needed-files ~10 MB. Focused on the Gemma-4 architecture.
 
-**Hedef modeller:**
+**Target models:**
 - `gemma-4-E2B-it-UD-Q8_K_XL.gguf` — 2B param target (Q8, ~2.8 GB)
 - `gemma-4-E2B-it-assistant.F16.gguf` — 78M MTP/EAGLE draft head (F16, 174 MB)
 - `gemma-4-E4B-it-Q8_0.gguf` — 4B target (Q8, ~8.2 GB)
-- `gemma-4-E4B-it-assistant.F16.gguf` — eşleşen E4B draft
+- `gemma-4-E4B-it-assistant.F16.gguf` — matching E4B draft
 
-Mimari özet: `gemma4` arch (target) + `gemma4_assistant` arch (draft). Assistant kendi K/V'sini
-saklamaz — her layer'ında target modelin paylaşılan K/V'sine cross-attention yapar. Output:
-post_projection feature (chain için) + centroid masked-embedding logit head.
+Architecture summary: `gemma4` arch (target) + `gemma4_assistant` arch (draft). The assistant has no self K/V — every layer cross-attends the target model's shared K/V. Output: post_projection feature (for chaining) + centroid masked-embedding logit head.
 
 ---
 
-## 2. Aşama 1 — Full tree'de SD bug avı
+## 2. Phase 1 — SD bug hunt in full tree
 
-### Başlangıç durumu
+### Starting state
 
 ```
 G4A draft[step] i=0 id=178830('Zag') p=1.0
 G4A   TARGET id_last=100 logit=-16 dense_rank=4096 (MASKED OUT)
-[ Prompt: 142 t/s | Generation: 6.5 t/s ]   ← bozuk
+[ Prompt: 142 t/s | Generation: 6.5 t/s ]   ← broken
 ```
 
-Pipeline kuruluydu ama %0 accept, draft tamamen çöp token öneriyordu (`Zag`, `HttpServlet`,
-`아멘`, emoji), generation 6.5 t/s, Metal crash (CPU-only çalıştı).
+Pipeline was built but 0% acceptance, draft proposing garbage tokens (`Zag`, `HttpServlet`, `아멘`, emoji), generation 6.5 t/s, Metal crash (CPU-only worked).
 
-### Metodoloji: tahmin değil, ölç
+### Methodology: don't guess, measure
 
-HF transformers `gemma4_assistant`'ını referans olarak kurdum (`/tmp/g4a_venv`, scripts'ler
-`/tmp/g4a_*.py`). Sayısal karşılaştırma:
+Set up HF transformers `gemma4_assistant` as reference (`/tmp/g4a_venv`, scripts `/tmp/g4a_*.py`). Numerical comparison:
 
-| Karşılaştırma | Sonuç | Çıkarım |
-|---------------|-------|---------|
-| llama draft forward vs HF (aynı concat ile) | cosine 1.0 | Forward matematiği doğru |
-| HF mekanizması (normal template) | 8/8 acceptance | Assistant sağlam |
-| HF mekanizması (thinking template, llama'nın 21 token'ı) | 6/8 acceptance | Mekanizma + assistant tamam |
-| llama dump → HF assistant | rank 4096 (mask) | llama input değerleri yanlış |
+| Comparison | Result | Conclusion |
+|------------|--------|------------|
+| llama draft forward vs HF (same concat) | cosine 1.0 | Forward math correct |
+| HF mechanism (normal template) | 8/8 acceptance | Assistant solid |
+| HF mechanism (thinking template, llama's 21 tokens) | 6/8 acceptance | Mechanism + assistant fine |
+| llama dump → HF assistant | rank 4096 (masked) | llama input values wrong |
 
-İzolasyon: **llama'nın target forward'ı HF'den farklı değerler üretiyor.** Bileşen-bileşen
-cosine karşılaştırması:
+Isolation: **llama's target forward produces different values than HF.** Component-by-component cosine comparison:
 
-| Bileşen | cos | Magnitude | Verdict |
-|---------|-----|-----------|---------|
-| `embed` (scaled HF) vs llama | 1.0 | HF ratio 39.2 | **scale eksik** |
-| `embed` (raw) vs llama | 1.0 | ratio 1.0 | Raw doğru, scale yok |
+| Component | cos | Magnitude | Verdict |
+|-----------|-----|-----------|---------|
+| `embed` (scaled HF) vs llama | 1.0 | HF ratio 39.2 | **scale missing** |
+| `embed` (raw) vs llama | 1.0 | ratio 1.0 | Raw correct, no scale |
 | `hidden` post-norm | 0.9997 | ratio 1.004 | ✅ |
 | `k_full` | 0.9998 | ratio 1.0 | ✅ |
-| `v_full` | **-0.02** | ratio 0.63 | ✗✗ tap çöp |
-| `k_swa` | **0.06** | ratio 0.30 | ✗✗ tap çöp |
-| `v_swa` | **0.43** | ratio 2.27 | ✗ tap çöp |
+| `v_full` | **-0.02** | ratio 0.63 | ✗✗ tap garbage |
+| `k_swa` | **0.06** | ratio 0.30 | ✗✗ tap garbage |
+| `v_swa` | **0.43** | ratio 2.27 | ✗ tap garbage |
 
-`k_full` doğru ama aynı layer'ın `v_full`'ü ve SWA K/V çöp → tap host-copy bug'ı.
+`k_full` correct but the same layer's `v_full` and SWA K/V are garbage → tap host-copy bug.
 
-### 3 root-cause bug
+### 3 root-cause bugs
 
-#### Bug 1: `ggml_set_output` eksik (ROOT CAUSE + Metal crash)
+#### Bug 1: `ggml_set_output` missing (ROOT CAUSE + Metal crash)
 
-`src/models/gemma4.cpp`'de hidden tap `ggml_set_output()` çağırıyordu ama 4 K/V tap tensoru
-çağırmıyordu (yalnız `ggml_build_forward_expand`). ggml-alloc scheduler bu intermediate
-tensor'ların buffer'larını sonraki op'lar için reuse ediyor → host async tap **bayat veri**
-okuyor. k_full şans eseri hayatta kalıyor, V/SWA üzerine yazılıyor.
+In `src/models/gemma4.cpp`, hidden tap called `ggml_set_output()` but the 4 K/V tap tensors did not (only `ggml_build_forward_expand`). ggml-alloc scheduler reuses these intermediate tensors' buffers for subsequent ops → host async tap reads **stale data**. k_full survives by luck, V/SWA overwritten.
 
-**Aynı bug Metal crash'inin de sebebi:** `GGML_ASSERT(buf_dst)` — okunabilir Metal buffer'ı
-olmayan tensor.
+**Same bug was the cause of the Metal crash:** `GGML_ASSERT(buf_dst)` — tensor with no readable Metal buffer.
 
 **Fix:**
 ```cpp
@@ -102,95 +91,83 @@ if (kv_tap_k_swa)  { ggml_set_output(kv_tap_k_swa);  ggml_build_forward_expand(g
 if (kv_tap_v_swa)  { ggml_set_output(kv_tap_v_swa);  ggml_build_forward_expand(gf, kv_tap_v_swa);  }
 ```
 
-#### Bug 2: Target embed scale eksik
+#### Bug 2: Target embed scale missing
 
-`llama_model_get_token_embd` ham (unscaled) embedding satırı döner. HF candidate generator
-`Gemma4TextScaledWordEmbedding` kullanır — `×√hidden` (E2B için ×39.19).
+`llama_model_get_token_embd` returns raw (unscaled) embedding row. HF candidate generator uses `Gemma4TextScaledWordEmbedding` — `×√hidden` (×39.19 for E2B).
 
-**Fix:** `common/speculative.cpp` draft loop'unda concat oluştururken `tmp_embd[j] *= √n_embd_backbone`.
+**Fix:** In `common/speculative.cpp` draft loop, when building concat: `tmp_embd[j] *= √n_embd_backbone`.
 
-#### Bug 3: Centroid masked-embedding head implement edilmemiş
+#### Bug 3: Centroid masked-embedding head not implemented
 
-Gemma-4 assistant'ın logit head'i dense lm_head değil, `Gemma4AssistantMaskedEmbedder`:
+Gemma-4 assistant's logit head is not dense lm_head, it's `Gemma4AssistantMaskedEmbedder`:
 1. Centroid logits = `mtp_centroids @ hidden` ([2048])
-2. Top-32 cluster seç
-3. O cluster'ların token'larıyla kısıtlı dense logit'lerden argmax
+2. Select top-32 clusters
+3. Argmax from dense logits restricted to those clusters' tokens
 
-llama dense lm_head kullanıyordu → garbage. Math equivalent: dense logits restricted to
-top-k cluster'lar.
+llama was using dense lm_head → garbage. Math equivalent: dense logits restricted to top-k clusters.
 
 **Fix:**
-- Graph'a `centroid_logits` çıktısı ekle (feature ile concat edilerek embeddings buffer'ına)
-- Host'ta `token_to_cluster[canon_id] = cluster` haritası kur
-- `masked_argmax(dense_logits, centroid_logits, token_to_cluster, top_k)` ile argmax
+- Add `centroid_logits` output to graph (concatenated with feature into embeddings buffer)
+- Build `token_to_cluster[canon_id] = cluster` map on host
+- Use `masked_argmax(dense_logits, centroid_logits, token_to_cluster, top_k)` for argmax
 
-### Bug 1 sonrası sonuçlar (full tree)
+### Results after Bug 1 (full tree)
 
-| Test | Önce | Sonra |
-|------|------|-------|
-| Acceptance | 0% | %50-85 (görev tipine göre) |
+| Test | Before | After |
+|------|--------|-------|
+| Acceptance | 0% | 50-85% (by task type) |
 | E2B baseline Metal | 51 t/s | 51 t/s |
-| E2B SD Metal yapısal | 6.5 t/s (bozuk) | **80 t/s** (acc %78) |
-| E4B SD Metal counting | (E4B-Uncensored mismatch %0) | **49.8 t/s = 1.69×** |
-| Metal crash | crash | ✅ çözüldü |
+| E2B SD Metal structured | 6.5 t/s (broken) | **80 t/s** (acc 78%) |
+| E4B SD Metal counting | (E4B-Uncensored mismatch 0%) | **49.8 t/s = 1.69×** |
+| Metal crash | crash | ✅ fixed |
 
 ---
 
-## 3. Aşama 2 — `only-needed-files`'a SD portu
+## 3. Phase 2 — SD port to `only-needed-files`
 
-### Hedef
+### Goal
 
-Full tree'deki SD altyapısı `common/speculative.cpp` (~5000 satır + jinja/sampling deps)
-gerektiriyordu. only-needed-files'a minimal port: ~1100 satır.
+Full tree's SD infrastructure required `common/speculative.cpp` (~5000 lines + jinja/sampling deps). Minimal port to only-needed-files: ~1100 lines.
 
-### Yapılan
+### What was done
 
-**Shared dosyalara additive eklentiler (drift değil, sadece SD):**
+**Additive additions to shared files (no drift, only SD):**
 
-| Dosya | Δ satır | Ne |
-|-------|---------|-----|
-| `src/llama-arch.h` | +9 | LLM_ARCH_GEMMA4_ASSISTANT enum + 4 KV key + 4 tensor enum |
+| File | Δ lines | What |
+|------|---------|------|
+| `src/llama-arch.h` | +9 | LLM_ARCH_GEMMA4_ASSISTANT enum + 4 KV keys + 4 tensor enums |
 | `src/llama-arch.cpp` | +14 | name, KV key, tensor name + tensor_info dispatch |
-| `src/llama-hparams.h` | +6 | 4 yeni alan (n_embd_backbone, n_centroids, top_k, use_ordered) |
+| `src/llama-hparams.h` | +6 | 4 new fields (n_embd_backbone, n_centroids, top_k, use_ordered) |
 | `src/llama-hparams.cpp` | +6 | n_embd_inp() override |
 | `src/llama-cparams.h` | +1 | assistant_kv_tap flag |
-| `src/llama-ext.h` | +37 | 6 yeni API (set/get tap, accessors) |
+| `src/llama-ext.h` | +37 | 6 new APIs (set/get tap, accessors) |
 | `src/llama-graph.h` | +63 | assistant_shared_kv + input + result tensors |
 | `src/llama-graph.cpp` | +70 | build_inp_assistant_kv + set_input |
 | `src/llama-context.h` | +36 | tap host buffer + APIs |
 | `src/llama-context.cpp` | +112 | tap copy in decode + APIs + MTP ctx relax |
-| `src/llama-model.cpp` | +50 | factory case + 4 accessor + nullptr memory |
+| `src/llama-model.cpp` | +50 | factory case + 4 accessors + nullptr memory |
 | `src/models/models.h` | +30 | llama_model_gemma4_assistant class decl |
-| `src/models/gemma4.cpp` | +50 | K/V + hidden tap (ggml_set_output ile) |
+| `src/models/gemma4.cpp` | +50 | K/V + hidden tap (with ggml_set_output) |
 
-**Yeni dosyalar:**
+**New files:**
 
-| Dosya | Satır | Ne |
-|-------|------:|-----|
-| `src/models/gemma4_assistant.cpp` | 240 | Assistant arch implementation (full tree'den verbatim) |
-| `examples/spec/spec.cpp` | 438 | Minimal SD driver (common dep yok) |
+| File | Lines | What |
+|------|------:|------|
+| `src/models/gemma4_assistant.cpp` | 240 | Assistant arch implementation (verbatim from full tree) |
+| `examples/spec/spec.cpp` | 438 | Minimal SD driver (no common deps) |
 | `examples/spec/CMakeLists.txt` | 5 | Build glue |
 
-**Toplam:** ~1100 satır yeni C++. Full tree'nin SD katmanı ~5000 + jinja 5800 = ~10800 satır;
-port ~%10'u.
+**Total:** ~1100 new C++ lines. Full tree's SD layer ~5000 + jinja 5800 = ~10800 lines; port is ~10% of that.
 
-### Karşılaşılan zorluklar (port sırasında)
+### Challenges encountered (during port)
 
-- **Diff'lerin temizliği:** `llama-model.cpp`'de 303 satır diff vardı ama %80'i full-tree'deki
-  diğer arch'ların factory case'leriydi (drift). Sadece gemma4_assistant ile ilgili ~50 satır
-  ekledim. Aynısı `models.h`'da: 1887 satır diff vardı ama only-needed-files'ın 31 satırı sadece
-  gemma4 class'ı içeriyor; sadece 30 satır assistant class decl ekledim.
-- **CMake GLOB cache'i:** Yeni `gemma4_assistant.cpp` dosyası eklenince ilk build link error
-  verdi. `cmake ..` ile yeniden config gerekti.
-- **Speculative loop'un common-bağımsız hali:** `common/speculative.cpp`'nin
-  `common_speculative_state_draft_gemma4_assistant` struct'ı 448 satırdı (multi-seq abstraction,
-  common_sampler dep, staged accept'i, env toggle'lar). Bunları çıkararak ~250 satırlık tek-seq
-  greedy çekirdek loop'u inline ettim.
+- **Diff cleanliness:** `llama-model.cpp` had a 303-line diff but ~80% were other arch factory cases from the full tree (drift). Added only ~50 lines relevant to gemma4_assistant. Same for `models.h`: 1887-line diff but only-needed-files had 31 lines (just gemma4 class); added only 30 lines of assistant class decl.
+- **CMake GLOB cache:** Adding new `gemma4_assistant.cpp` caused link errors on first build. Required `cmake ..` to reconfigure.
+- **Common-independent spec loop:** `common/speculative.cpp`'s `common_speculative_state_draft_gemma4_assistant` was 448 lines (multi-seq abstraction, common_sampler dep, staged accept, env toggles). Stripped to a ~250-line single-seq greedy core loop inlined in spec.cpp.
 
-### KV cache rollback bug'ı (port'ta yakalanan)
+### KV cache rollback bug (caught during port)
 
-Spec.cpp'nin ilk versiyonu rejected draft pozisyonlarını target'ın KV cache'inden silmiyordu →
-ikinci round'da pozisyon tutarsızlığı (X=41, Y=41 — Y=X+1 olmalı). Fix:
+Spec.cpp's first version didn't remove rejected draft positions from the target's KV cache → position inconsistency in the second round (X=41, Y=41 — Y should be X+1). Fix:
 
 ```cpp
 if (batch_t.n_tokens > n_keep) {
@@ -200,26 +177,26 @@ if (batch_t.n_tokens > n_keep) {
 
 ---
 
-## 4. Aşama 3 — Chat + Tool use + SD entegrasyonu
+## 4. Phase 3 — Chat + Tool use + SD integration
 
-### `llama-chat` (yeni)
+### `llama-chat` (new)
 
-Multi-turn REPL + sandbox'lı tool dispatch + opsiyonel SD.
+Multi-turn REPL + sandboxed tool dispatch + optional SD.
 
 **Args:**
-| Flag | Default | Etki |
-|------|---------|------|
-| `-m` | (zorunlu) | target model |
-| `-md` | (yok) | varsa SD aç |
-| `--draft-max` | 3 | round başına draft token |
-| `--no-sd` | (kapalı) | -md verilse bile SD'yi kapat |
-| `--thinking` | (kapalı) | reasoning trace aç |
-| `--no-tools` | (açık) | tool tanımlarını kaldır |
-| `--root` | `$HOME` | tool sandbox kökü |
+| Flag | Default | Effect |
+|------|---------|--------|
+| `-m` | (required) | target model |
+| `-md` | (none) | if present, enable SD |
+| `--draft-max` | 3 | draft tokens per round |
+| `--no-sd` | (off) | disable SD even if -md provided |
+| `--thinking` | (off) | enable reasoning trace |
+| `--no-tools` | (on) | remove tool definitions |
+| `--root` | `$HOME` | tool sandbox root |
 
 **Tools (read-only, realpath sandbox):**
 - `read_file(path)` — max 16 KiB
-- `list_dir(path)` — max 200 entry
+- `list_dir(path)` — max 200 entries
 
 **Per-turn stats (stderr):**
 ```
@@ -228,244 +205,194 @@ Multi-turn REPL + sandbox'lı tool dispatch + opsiyonel SD.
 
 **Gemma-4 chat template:**
 
-`src/llama-chat.{h,cpp}`'ye `LLM_CHAT_TEMPLATE_GEMMA_4` enum + detect branch (`<|tool_call>`
-veya `<|turn>` substring) + apply branch eklendi. Apply branch turn delimiters'ları üretiyor
-(`<bos>`, `<|turn>{role}\n…<turn|>\n`), tool/thinking marker'larını caller (chat.cpp)
-system content'ine gömüyor.
+`LLM_CHAT_TEMPLATE_GEMMA_4` enum + detect branch (`<|tool_call>` or `<|turn>` substring) + apply branch added to `src/llama-chat.{h,cpp}`. Apply branch produces turn delimiters (`<bos>`, `<|turn>{role}\n…<turn|>\n`); tool/thinking markers are embedded by caller (chat.cpp) in system content.
 
-**Yeni dosya/satır:**
-| Dosya | Satır |
-|-------|------:|
+**New files/lines:**
+| File | Lines |
+|------|------:|
 | `src/llama-chat.{h,cpp}` (additive) | +25 |
-| `examples/chat/chat.cpp` | 631 (init 389 + SD eklentisi 242) |
+| `examples/chat/chat.cpp` | 631 (initial 389 + SD addition 242) |
 | `examples/chat/CMakeLists.txt` | 5 |
 
-### Karşılaşılan zorluklar
+### Challenges encountered
 
-- **`llama_chat_apply_template` C API tools/thinking taşımıyor** → caller system message content'ine
-  embed eden tasarıma geçtim, ayrı `_ex` API eklemeye gerek kalmadı.
-- **`std::regex` `[^]` desteklemiyor** → `.*?` ile değiştirdim.
-- **`realpath` symlink takip** → macOS'ta `/tmp` → `/private/tmp`. `realpath_s(--root)` ile
-  prefix kontrolü.
-- **Tool-call durma koşulu** → `<tool_call|>` substring'i `assistant_text` içinde aranıyor;
-  bulununca break + dispatch.
-- **Multi-turn KV cache yönetimi (string-substr tail diff)** — tutarlılık için **raw push**
-  (thinking strip etmiyorum) zorunlu oldu. İlk versiyon thinking'i strip ediyordu → next turn
-  `[chat] empty tail tokenization` patladı. Fix: gemma jinja'sında `<|channel>` blokları zaten
-  context'te yaşamak için tasarlanmış.
-- **`parse_special=true`** tokenize/detokenize her yerde zorunlu (tool token'ları tek-token
-  olsun diye).
-- **Chat'te SD entegrasyonu — KV cache invariant'ları:** acc_nkv == kv_pos (target seq 0 size)
-  her zaman tutmalı. Verify sonrası rollback + n_keep kadar ilerlet. Turn-arası bu state
-  korunarak incremental tail prefill çalışıyor.
-- **Multi-chunk prefill'de tap reset (sonradan bulundu):** Tail uzunsa `llama_decode`
-  birden fazla chunk halinde çağrılır. Her çağrıda target'ın tap buffer'ı (`n_tokens_prev==0`
-  case'inde) silinir → sadece son chunk'ın K/V'si tap'te kalır. Belirti: büyük tool result
-  veya uzun ilk prompt'tan sonra `tap=N tail=M` mismatch (`N << M`). Fix: tap'i her chunk
-  sonrası oku ve acc'a ekle.
-- **Çift BOS:** apply branch literal `<bos>` ekliyor; `tokenize(..., add_special=true)`
-  da BOS ekliyor → çift. Belirti: `check_double_bos_eos: ... 2 BOS tokens` warning. Fix:
-  daima `add_special=false`.
-- **stderr log spam:** llama internal log'ları stdout'u boğuyor, kullanıcı cevabı tam
-  göremiyor. Fix: `llama_log_set(cb)` ile filtre — WARN ve üzeri görünür, INFO/DEBUG gizli
-  (LLAMA_VERBOSE=1 ile aç). Ayrıca tüm verbose log'lar `logs/session-YYYYMMDD-HHMMSS.log`
-  dosyasına yazılıyor (sonra inceleme için).
-- **KV cache exhaustion cascade (sonradan bulundu):** uzun tool result (README, log dosyası)
-  veya çok turn sonrası `acc_nkv` n_ctx'e yaklaşıyor → `llama_decode` `failed to find a
-  memory slot for batch of size N` döner → state korrupt, sonraki turn'ler de patlar
-  (`decode failed`, `gen=0 tok`). Belirti: 3-4 ardışık decode fail.
-  **Fix iki katmanlı:**
-  1. **Proactive**: REPL turn başında `acc_nkv > n_ctx - 1024` ise history rotate edilir
-     (system msg + sadece yeni user msg tutulur; KV temizlenir).
-  2. **Reactive**: decode fail olduğunda `reset_chat(keep_last_user=false)` çağrılır —
-     sadece system msg kalır, sonraki user prompt fresh başlar. `llama_memory_seq_rm` ile
-     target + draft KV cache temizlenir, acc K/V vektörleri ve `last_formatted` sıfırlanır.
-- **Prefill counter inaccurate when decode fails (sonradan):** `turn_prefill_tok` peşin
-  sayılıyordu (`+= tail.size()`); decode chunk ortasında fail olunca counter tam, süre kısa
-  → bogus rate (`prefill=6094 tok / 0.11s = 57628 t/s`). **Fix:** her başarılı chunk
-  decode'undan sonra `turn_prefill_tok += n` (gerçekten işlenen).
-- **Empty turn (gen=0) UX (sonradan):** model bazen ilk token olarak EOG sample ediyor →
-  turn boş bitiyor → kullanıcı hang sanıyor. **Fix:** `[chat] (model produced no output
-  for this turn)` notu basılır.
+- **`llama_chat_apply_template` C API doesn't carry tools/thinking** → switched to design where caller embeds them in system message content, no separate `_ex` API needed.
+- **`std::regex` doesn't support `[^]`** → replaced with `.*?`.
+- **`realpath` symlink following** → on macOS `/tmp` → `/private/tmp`. Prefix check with `realpath_s(--root)`.
+- **Tool-call stop condition** → `<tool_call|>` substring searched in `assistant_text`; break + dispatch on match.
+- **Multi-turn KV cache management (string-substr tail diff)** — consistency required **raw push** (no thinking strip). First version stripped thinking → `[chat] empty tail tokenization` crash on next turn. Fix: `<|channel>` blocks in gemma jinja are designed to live in context.
+- **`parse_special=true`** required everywhere in tokenize/detokenize (so tool tokens are single tokens).
+- **SD integration in chat — KV cache invariants:** acc_nkv == kv_pos (target seq 0 size) must always hold. Rollback after verify + advance by n_keep. Incremental tail prefill works with this state preserved across turns.
+- **Tap reset in multi-chunk prefill (found later):** If tail is long, `llama_decode` is called in multiple chunks. Each call clears the target's tap buffer (in the `n_tokens_prev==0` case) → only the last chunk's K/V stays in the tap. Symptom: `tap=N tail=M` mismatch (`N << M`) after large tool result or long first prompt. Fix: read tap and append to acc after each successful chunk decode.
+- **Double BOS:** Apply branch adds literal `<bos>`; `tokenize(..., add_special=true)` also adds BOS → double. Symptom: `check_double_bos_eos: ... 2 BOS tokens` warning. Fix: always `add_special=false`.
+- **stderr log spam:** llama internal logs drowning user output. Fix: `llama_log_set(cb)` filter — WARN and above visible, INFO/DEBUG hidden (enable with `LLAMA_VERBOSE=1`). Also all verbose logs written to `logs/session-YYYYMMDD-HHMMSS.log` for later inspection.
+- **KV cache exhaustion cascade (found later):** Long tool result (README, log file) or many turns → `acc_nkv` approaches n_ctx → `llama_decode` returns `failed to find a memory slot for batch of size N` → state corrupt, subsequent turns also fail (`decode failed`, `gen=0 tok`). Symptom: 3-4 consecutive decode fails.
+  **Two-layer fix:**
+  1. **Proactive**: At REPL turn start, if `acc_nkv > n_ctx - 1024`, rotate history (keep system msg + only new user msg; clear KV).
+  2. **Reactive**: On decode failure, call `reset_chat(keep_last_user=false)` — only system msg kept, next user prompt starts fresh. `llama_memory_seq_rm` clears target + draft KV cache, acc K/V vectors and `last_formatted` reset.
+- **Prefill counter inaccurate when decode fails (found later):** `turn_prefill_tok` was counted eagerly (`+= tail.size()`); decode failure mid-chunk left counter at full, time short → bogus rate (`prefill=6094 tok / 0.11s = 57628 t/s`). **Fix:** `turn_prefill_tok += n` after each successful chunk decode (actual count).
+- **Empty turn (gen=0) UX (found later):** Model sometimes samples EOG as first token → turn ends empty → user thinks it hung. **Fix:** `[chat] (model produced no output for this turn)` note printed.
 
 ---
 
-## 5. Mevcut performans tablosu
+## 5. Current performance table
 
 ### E2B (target 2B Q8, draft 78M F16) — Metal -ngl 99
 
-| Test | Tool | t/s | Acc | Round | Hızlanma |
-|------|------|----:|----:|------:|---------:|
+| Test | Tool | t/s | Acc | Rounds | Speedup |
+|------|------|----:|----:|-------:|--------:|
 | baseline (no SD) | llama-spec/chat | 51 | — | — | 1.00× |
-| **primes (n=5) — REBUILD FIX SONRASI** | llama-chat | **114.7** | %87 | 43 | **2.25×** |
-| **primes (n=5) — REBUILD FIX SONRASI** | llama-spec | **106.1** | %82 | 45 | **2.08×** |
-| primes (n=5) — fix öncesi | llama-spec | 80.6 | %78 | — | 1.58× |
-| primes (n=5) — fix öncesi | llama-chat | 57.3 | %79 | 24 | 1.12× |
-| count 1-100 (n=2) | llama-spec | 53.1 | %62 | — | 1.04× |
-| Eiffel paragraf (n=2) | llama-spec | 50.6 | %52 | — | 1.00× |
-| robot hikayesi (n=2) | llama-spec | 41.5 | %39 | — | 0.81× |
+| **primes (n=5) — AFTER REBUILD FIX** | llama-chat | **114.7** | 87% | 43 | **2.25×** |
+| **primes (n=5) — AFTER REBUILD FIX** | llama-spec | **106.1** | 82% | 45 | **2.08×** |
+| primes (n=5) — before fix | llama-spec | 80.6 | 78% | — | 1.58× |
+| primes (n=5) — before fix | llama-chat | 57.3 | 79% | 24 | 1.12× |
+| count 1-100 (n=2) | llama-spec | 53.1 | 62% | — | 1.04× |
+| Eiffel paragraph (n=2) | llama-spec | 50.6 | 52% | — | 1.00× |
+| robot story (n=2) | llama-spec | 41.5 | 39% | — | 0.81× |
 
 ### E4B (target 4B Q8, draft F16) — Metal -ngl 99
 
-**Eski (rebuild fix öncesi):**
+**Old (before rebuild fix):**
 
-| Test | Tool | t/s | Acc | Round | Hızlanma |
-|------|------|----:|----:|------:|---------:|
+| Test | Tool | t/s | Acc | Rounds | Speedup |
+|------|------|----:|----:|-------:|--------:|
 | baseline | llama-spec | 29.4 | — | — | 1.00× |
-| count 1-100 (n=3) | llama-spec | 49.8 | %85 | 83 | 1.69× |
-| photosynthesis (n=3) | llama-spec | 38.0 | %55 | — | 1.29× |
-| Eiffel (n=3) | llama-spec | 30.6 | %52 | — | 1.03× |
+| count 1-100 (n=3) | llama-spec | 49.8 | 85% | 83 | 1.69× |
+| photosynthesis (n=3) | llama-spec | 38.0 | 55% | — | 1.29× |
+| Eiffel (n=3) | llama-spec | 30.6 | 52% | — | 1.03× |
 
-**REBUILD FIX SONRASI (yeni, llama-chat) — kapsamlı bench:**
+**AFTER REBUILD FIX (new, llama-chat) — comprehensive bench:**
 
-| Prompt | Baseline | SD (n=3) | Hızlanma | Acc | Yorum |
-|--------|---------:|---------:|---------:|----:|-------|
-| First 50 primes | 28.5 | **73.6** | **2.58×** | %99 | Şampiyon — düzenli liste |
-| First 50 primes (n=5) | 28.5 | 70.7 | 2.48× | %89 | Daha düşük acc |
-| Verbs list (alphab) | 27.6 | 52.0 | 1.88× | %60 | Liste, orta tahmin |
-| Python factorial | (~28) | 62.6 | 2.20× | %76 | Kod, kalıplı |
-| Python reverse string | 27.2 | 50.8 | 1.87× | %59 | Kod |
-| Count 1-50 | (~28) | 62.4 | 2.19× | %81 | Sayma |
-| Database index açıklama | 27.4 | 36.8 / 32.9 | 1.20-1.29× | %25-33 | Açıklayıcı düz metin |
-| TCP açıklama | 27.4 | 32.9 | 1.20× | %25 | Açıklayıcı |
-| Sea poem | 25.8 | 29.2 | 1.13× | %26 | Yaratıcı |
-| Autumn haiku | (~28) | 28.0 | 0.98× | %25 | Yaratıcı kısa |
-| Translate FR (10 tok) | 20.8 | 26.7 | 1.28× | %33 | Çok kısa, prefill domine |
+| Prompt | Baseline | SD (n=3) | Speedup | Acc | Note |
+|--------|--------:|---------:|--------:|----:|------|
+| First 50 primes | 28.5 | **73.6** | **2.58×** | 99% | Champion — regular list |
+| First 50 primes (n=5) | 28.5 | 70.7 | 2.48× | 89% | Lower acc |
+| Verbs list (alphab) | 27.6 | 52.0 | 1.88× | 60% | List, medium predictability |
+| Python factorial | (~28) | 62.6 | 2.20× | 76% | Code, templated |
+| Python reverse string | 27.2 | 50.8 | 1.87× | 59% | Code |
+| Count 1-50 | (~28) | 62.4 | 2.19× | 81% | Counting |
+| Database index explanation | 27.4 | 36.8 / 32.9 | 1.20-1.29× | 25-33% | Explanatory prose |
+| TCP explanation | 27.4 | 32.9 | 1.20× | 25% | Explanatory |
+| Sea poem | 25.8 | 29.2 | 1.13× | 26% | Creative |
+| Autumn haiku | (~28) | 28.0 | 0.98× | 25% | Short creative |
+| Translate FR (10 tok) | 20.8 | 26.7 | 1.28× | 33% | Very short, prefill dominates |
 
-**Pattern (acc rate doğrudan hızla korele):**
-- %99 acc → 2.58× (teorik max'a yakın)
-- %60-80 acc → 1.9-2.2×
-- %25-35 acc → 1.1-1.3× (overhead kazancı yiyor)
+**Pattern (acc rate directly correlated with speed):**
+- 99% acc → 2.58× (close to theoretical max)
+- 60-80% acc → 1.9-2.2×
+- 25-35% acc → 1.1-1.3× (overhead eating the gain)
 
-**Yapısal görevde 3× hedefe %88 ulaşıldı (2.58/3.0). Yaratıcı metinde SD net etkisiz/marjinal.**
+**88% of the 3× target reached on structured tasks (2.58/3.0). SD neutral/marginal on creative text.**
 
-**Q8 draft assistant testi (E4B):** F16 (174 MB) vs Q8 (100 MB) — hız ve acc rate aynı
-(±1 t/s, gürültü). Beklenen +%10-15 kazanç gerçekleşmedi. Sebep: draft model çok küçük
-(78M params), round'daki payı sadece ~%10. Bandwidth halve marjinal etki. **Q8'in tek avantajı
-disk/RAM tasarrufu** (~75 MB).
+**Q8 draft assistant test (E4B):** F16 (174 MB) vs Q8 (100 MB) — speed and acc rate identical (±1 t/s, noise). Expected +10-15% gain didn't materialize. Reason: draft model very small (78M params), its share per round is only ~10%. Halving bandwidth has marginal effect. **Q8's only advantage is disk/RAM savings** (~75 MB).
 
-**Pattern:** kazanç prompt tahmin edilebilirliğiyle orantılı, model boyutuyla orantılı.
+**Pattern:** gain proportional to prompt predictability, proportional to model size.
 
 ---
 
-## 6. Niye %79 acceptance 3× hızlanma getirmiyor?
+## 6. Why doesn't 79% acceptance give 3× speedup?
 
-### Saf teorik üst sınır
+### Pure theoretical upper bound
 
-E2B, n=5, acc %79 → round başına ~4 accept + 1 bonus = ~5 token/round.
+E2B, n=5, acc 79% → ~4 accept + 1 bonus per round = ~5 tokens/round.
 
-**İdeal maliyet:**
-- Verify batch (6 token) GPU'da memory-bound: ≈1 target forward
-- 5 draft forward (78M, ~%3 target boyutu): ≈0.15 target forward
-- **Toplam ~1.15 target-forward × 5 token = 0.23 forward/token → ~4× teorik**
+**Ideal cost:**
+- Verify batch (6 tokens) GPU memory-bound: ≈1 target forward
+- 5 draft forwards (78M, ~3% of target size): ≈0.15 target forwards
+- **Total ~1.15 target-forward × 5 tokens = 0.23 forward/token → ~4× theoretical**
 
-### Gerçekte ne oluyor?
+### What actually happens
 
-Round başına ölçülemeyen sabit overhead'ler:
+Unmeasured fixed overheads per round:
 
-| Bileşen | Tahmini ms/round (Metal, E2B) |
-|---------|---:|
+| Component | Estimated ms/round (Metal, E2B) |
+|-----------|--------------------------------:|
 | Verify batch (target) | ~20 |
-| 5 draft forward (assistant) | ~5 |
+| 5 draft forwards (assistant) | ~5 |
 | **Graph rebuild (sched_need_reserve=true)** | **~15-20** |
 | Tap copy GPU→CPU (K/V + hidden) | ~3 |
 | Scheduler bookkeeping / Metal cmd buffer sync | ~5 |
-| **TOPLAM** | **~48 ms / 5 token = ~9.6 ms/token = 104 t/s** |
+| **TOTAL** | **~48 ms / 5 tokens = ~9.6 ms/token = 104 t/s** |
 
-Ölçüm: 57 t/s = 17.5 ms/token. Aradaki ~8ms muhtemelen Metal GPU dispatch latency + memory
-sync.
+Measured: 57 t/s = 17.5 ms/token. The ~8 ms gap is likely Metal GPU dispatch latency + memory sync.
 
-### Ana darboğaz: graph rebuild
+### Main bottleneck: graph rebuild
 
-`set_assistant_shared_kv` her draft round'ında `sched_need_reserve=true` set ediyor (n_kv
-büyüdüğü için tensor şekli değişiyor). Bu her round'da:
-1. Draft graph yeniden plan
+`set_assistant_shared_kv` sets `sched_need_reserve=true` every draft round (tensor shape changes as n_kv grows). Each round this triggers:
+1. Draft graph re-plan
 2. Buffer reallocation
 3. ggml-alloc graph traversal
 
-CPU-side iş ama Metal GPU pipeline'ı dolduramadan blokluyor.
+CPU-side work but blocks the Metal GPU pipeline from filling.
 
-### Niye E2B 3×'e ulaşamıyor
+### Why E2B can't reach 3×
 
-Baseline 51 t/s = 19.6 ms/token. Round overhead 30 ms zaten baseline'ın 1.5 katı. 5 token'a
-bölünse bile 6 ms/token kazanç → maksimum 100 t/s teorik (2× baseline). Ölçüm bunun yarısı
-çünkü ek sync overhead var.
+Baseline 51 t/s = 19.6 ms/token. Round overhead 30 ms is already 1.5× baseline. Even divided by 5 tokens = 6 ms/token gain → theoretical max ~100 t/s (2× baseline). Measured is half that due to additional sync overhead.
 
-### Niye E4B'de daha iyi
+### Why E4B does better
 
-E4B baseline 30 t/s = 33 ms/token. Round 48ms / 5 token = 9.6 ms/token. Teorik 3.4×. Ölçüm
-1.69× — ama orada da %85 acc ve düşük n=3 ile.
+E4B baseline 30 t/s = 33 ms/token. Round 48ms / 5 tokens = 9.6 ms/token. Theoretical 3.4×. Measured 1.69× — but there too with 85% acc and low n=3.
 
-E4B'de adaptive n + graph rebuild fix ile 2.5-3× erişilebilir.
+With adaptive n + graph rebuild fix, 2.5-3× is reachable on E4B.
 
 ---
 
-## 7. 3×'e ulaşmak için yol haritası
+## 7. Roadmap to 3×
 
-### 7.1 Per-round graph rebuild eliminasyonu ✅ TAMAMLANDI
+### 7.1 Per-round graph rebuild elimination ✅ DONE
 
-**Sorun:** Her draft round'da n_kv büyüyor → tensor şekli değişiyor → graph rebuild
-(~15-20 ms/round CPU-side).
+**Problem:** Each draft round n_kv grows → tensor shape changes → graph rebuild (~15-20 ms/round CPU-side).
 
-**Yapılan çözüm:** Bucketed K/V capacity + padded mask.
-- `llama_assistant_shared_kv` struct'a `n_kv_full_cap` / `n_kv_swa_cap` alanları
-- `set_assistant_shared_kv` bucket'ı (next-power-of-2, min 256) hesaplar; sadece bucket
-  büyürse `sched_need_reserve=true` set eder
-- `build_inp_assistant_kv` tensor'ları `n_kv_cap` boyutunda alloc eder (actual değil)
-- `set_input` actual K/V'yi buffer'ın başına kopyalar, tail zero-fill; mask `[0, actual)=0`,
-  `[actual, cap)=-INF` ile unused pozisyonları softmax'ta sıfırlar
-- Session başına ~5 rebuild (256→512→1024→2048→4096), eskiden round başına 1 (~50+/turn)
-- Toplam: ~55 satır eklenti (`llama-graph.{h,cpp}` + `llama-context.{h,cpp}`)
+**Solution implemented:** Bucketed K/V capacity + padded mask.
+- `n_kv_full_cap` / `n_kv_swa_cap` fields added to `llama_assistant_shared_kv` struct
+- `set_assistant_shared_kv` computes bucket (next-power-of-2, min 256); sets `sched_need_reserve=true` only when bucket grows
+- `build_inp_assistant_kv` allocates tensors at `n_kv_cap` size (not actual)
+- `set_input` copies actual K/V to start of buffer, zero-fills tail; mask `[0, actual)=0`, `[actual, cap)=-INF` to zero out unused positions in softmax
+- ~5 rebuilds per session (256→512→1024→2048→4096), was 1 per round (~50+/turn)
+- Total: ~55 lines added (`llama-graph.{h,cpp}` + `llama-context.{h,cpp}`)
 
-**Ölçülen etki (E2B, Metal -ngl 99):**
+**Measured impact (E2B, Metal -ngl 99):**
 
-| Test | Önce | Sonra | Δ |
-|------|-----:|------:|--:|
-| **llama-chat primes (n=5)** | 57 t/s | **114.7 t/s** | **+%100** |
-| **llama-spec primes (n=5)** | 80 t/s | **106.1 t/s** | **+%32** |
-| baseline (greedy) | 51 t/s | 51 t/s | aynı |
-| acc_rate (primes) | %79 | %87 | +%8 |
+| Test | Before | After | Δ |
+|------|-------:|------:|--:|
+| **llama-chat primes (n=5)** | 57 t/s | **114.7 t/s** | **+100%** |
+| **llama-spec primes (n=5)** | 80 t/s | **106.1 t/s** | **+32%** |
+| baseline (greedy) | 51 t/s | 51 t/s | same |
+| acc_rate (primes) | 79% | 87% | +8% |
 | Lossless | ✓ | ✓ | — |
 
-**E2B chat artık baseline'ın 2.25× hızında** (yapısal görevde). chat'in ekstra kazancı (%32
-yerine %100) chat-spesifik per-round overhead'in (tail tokenize, template apply) de tek-seferlik
-olmasından geliyor.
+**E2B chat now 2.25× baseline speed** (on structured tasks). Chat's extra gain (+100% vs +32%) comes from chat-specific per-round overhead (tail tokenize, template apply) also becoming one-time.
 
-**Beklenen E4B etkisi (denenmedi):** baseline 30 → 60-70 t/s = ~2-2.3× (test edilecek).
+**Expected E4B impact (untested):** baseline 30 → 60-70 t/s = ~2-2.3× (to be tested).
 
 ### 7.2 Adaptive draft length
 
-**Sorun:** Sabit `n=5`, prompt'a göre overhead/kazanç dengesi bozuk. Yaratıcı metinde %30 acc
-ile n=5 boşa 3-4 draft yapıyor.
+**Problem:** Fixed `n=5` gives wrong overhead/gain balance per prompt. With 30% acc on creative text, n=5 wastes 3-4 draft steps.
 
-**Çözüm:** Her round'dan sonra acc rate'i izle, n'i dinamik ayarla:
-- acc rate > %70 → n++ (max 8)
-- acc rate < %30 → n-- (min 1)
-- Hysteresis ile salınımı önle
+**Solution:** Track acc rate after each round, adjust n dynamically:
+- acc rate > 70% → n++ (max 8)
+- acc rate < 30% → n-- (min 1)
+- Hysteresis to prevent oscillation
 
-**Tahmini etki:** Karışık prompt'larda %20-40 daha iyi t/s. Yaratıcı metin pozitif tarafa geçer
-(1.0× → 1.2-1.5×).
+**Estimated impact:** +20-40% better t/s on mixed prompts. Creative text flips positive (1.0× → 1.2-1.5×).
 
-**Tahmini LOC:** ~30 satır (chat.cpp + spec.cpp).
+**Estimated LOC:** ~30 (chat.cpp + spec.cpp).
 
 ### 7.3 SWA mask flip + multi-position verify batching
 
-**Sorun:** Verify batch'i sıralı pozisyonlarda decode ediyor (`acc_nkv, acc_nkv+1, ...`). SWA
-layer'lar sliding window kullanıyor — kısa context'te fark etmez ama uzun context'te SWA
-attention pattern hatalı çıkabilir.
+**Problem:** Verify batch decodes at sequential positions (`acc_nkv, acc_nkv+1, ...`). SWA layers use sliding window — no issue with short context but SWA attention pattern may be wrong on long context.
 
-**Çözüm:** Verify'da SWA mask'ı manuel set et. (Ref: HF candidate generator'daki `swa_mask.flip(dims=(-1,))`).
+**Solution:** Manually set SWA mask during verify. (Ref: `swa_mask.flip(dims=(-1,))` in HF candidate generator.)
 
-**Tahmini etki:** Uzun context (>512) doğruluğu. Hız etkisi minimum.
+**Estimated impact:** Long-context (>512) correctness. Minimal speed effect.
 
-**Tahmini LOC:** ~20 satır.
+**Estimated LOC:** ~20 lines.
 
-### 7.4 Daha büyük target — E4B'de full evaluation
+### 7.4 Larger target — full E4B evaluation
 
-E2B çok hızlı. E4B (4B param) baseline 30 t/s — SD'nin overhead'i orantısal olarak daha küçük
-kalır. Mevcut llama-chat'le E4B test edilmedi (sadece llama-spec).
+E2B is too fast. E4B (4B params) baseline 30 t/s — SD overhead proportionally smaller. Current llama-chat not tested with E4B (only llama-spec).
 
-**Eylem:** llama-chat'i E4B çiftiyle test et:
+**Action:** Test llama-chat with E4B pair:
 ```bash
 ./build/bin/llama-chat \
   -m  /Users/enes/Desktop/all/llms/gemma-4-E4B-it-Q8_0.gguf \
@@ -473,242 +400,221 @@ kalır. Mevcut llama-chat'le E4B test edilmedi (sadece llama-spec).
   -ngl 99 -c 2048 -b 512 --draft-max 3
 ```
 
-Beklenen: yapısal görevde 50+ t/s (vs 30 baseline) = 1.7×, graph-rebuild fix ile 2-2.5×.
+Expected: 50+ t/s on structured tasks (vs 30 baseline) = 1.7×, with graph-rebuild fix → 2-2.5×.
 
-### 7.5 Chat overhead azaltma
+### 7.5 Chat overhead reduction
 
-**Sorun:** llama-spec primes (n=5): 80 t/s; llama-chat aynı: 57 t/s. Fark **chat-spesifik
-overhead** (~%29):
-- `apply_template` her turn → string concat, std::string allocation
-- `parse_tool_call` regex tarama her turn
-- Multi-turn msg history yönetimi
+**Problem:** llama-spec primes (n=5): 80 t/s; llama-chat same: 57 t/s. Difference is **chat-specific overhead** (~29%):
+- `apply_template` every turn → string concat, std::string allocation
+- `parse_tool_call` regex scan every turn
+- Multi-turn message history management
 - `last_formatted` substr diff
 
-**Çözümler:**
-- Template apply'ı incremental yap (önceki formatted'a son msg'yi append et)
-- Tool detection'ı regex yerine substring + manual parse
-- assistant_text içine token IDs sakla, decode'u lazy yap
+**Solutions:**
+- Make template apply incremental (append last msg to previous formatted)
+- Replace regex tool detection with substring + manual parse
+- Store token IDs inside assistant_text, lazy decode
 
-**Tahmini etki:** Chat overhead'i %30 → %10. E2B chat SD 57 → 70 t/s.
+**Estimated impact:** Chat overhead 30% → 10%. E2B chat SD 57 → 70 t/s.
 
-**Tahmini LOC:** ~100 satır.
+**Estimated LOC:** ~100 lines.
 
 ### 7.6 KV scratch buffer pool
 
-**Sorun:** Verify her round'da tap host buffer'larını silip yeniden allocate ediyor
-(`n_tokens_prev==0` ile reset). std::vector::insert() alloc maliyeti var.
+**Problem:** Verify clears and re-allocates tap host buffers every round (`n_tokens_prev==0` reset). std::vector::insert() has allocation cost.
 
-**Çözüm:** Tek bir büyük scratch buffer, append yerine offset yaz.
+**Solution:** Single large scratch buffer, write by offset instead of append.
 
-**Tahmini etki:** Round başına ~1-2 ms kazanç. Marjinal.
+**Estimated impact:** ~1-2 ms gain per round. Marginal.
 
-**Tahmini LOC:** ~30 satır.
+**Estimated LOC:** ~30 lines.
 
 ### 7.7 Draft model quantization optimization
 
-**Şu an:** Assistant F16 (174 MB).
+**Current:** Assistant F16 (174 MB).
 
-**Alternatif:** Assistant Q8 (87 MB) → memory bandwidth %50 azalır → draft forward ~2× hızlı.
-Ama acc rate düşebilir (centroid head precision).
+**Alternative:** Assistant Q8 (87 MB) → memory bandwidth -50% → draft forward ~2× faster.
+But acc rate may drop (centroid head precision).
 
-**Tahmini etki:** Draft cost 5 → 2.5 ms/round. Acc rate'e bağlı net hız.
+**Estimated impact:** Draft cost 5 → 2.5 ms/round. Net speed depends on acc rate.
 
-**Tahmini iş:** Yeni Q8 assistant gguf üret (HF safetensors → quantize → gguf).
+**Estimated work:** Generate new Q8 assistant gguf (HF safetensors → quantize → gguf).
 
-### 7.8 Roadmap özet
+### 7.8 Roadmap summary
 
-| Önerilen iş | Tahmini etki | LOC | Risk |
-|------------|--------------|----:|------|
-| **Graph rebuild fix** | E2B 80 → 110 t/s, **E4B 50 → 70 t/s** | 80 | Orta |
-| **Adaptive n** | Karışık prompt'larda +20-40% | 30 | Düşük |
-| **Chat overhead azaltma** | E2B chat 57 → 70 t/s | 100 | Orta |
-| E4B llama-chat testi | (sadece ölçüm) | 0 | Yok |
-| Q8 assistant denemesi | ?% (acc bağımlı) | 0 + quantize | Düşük |
-| SWA mask doğruluğu | Uzun context | 20 | Düşük |
-| KV scratch pool | Marjinal | 30 | Düşük |
+| Recommended work | Estimated impact | LOC | Risk |
+|-----------------|-----------------|----:|------|
+| **Graph rebuild fix** | E2B 80 → 110 t/s, **E4B 50 → 70 t/s** | 80 | Medium |
+| **Adaptive n** | +20-40% on mixed prompts | 30 | Low |
+| **Chat overhead reduction** | E2B chat 57 → 70 t/s | 100 | Medium |
+| E4B llama-chat test | (measurement only) | 0 | None |
+| Q8 assistant trial | ?% (acc dependent) | 0 + quantize | Low |
+| SWA mask correctness | Long context | 20 | Low |
+| KV scratch pool | Marginal | 30 | Low |
 
-**3×'e ulaşma sırası:** önce graph rebuild fix → E4B chat testi → adaptive n. Bu üç madde
-yapısal görevde ~3×'e yaklaştırır (özellikle E4B + adaptive n ile).
+**Order to reach 3×:** first graph rebuild fix → E4B chat test → adaptive n. These three items get close to 3× on structured tasks (especially E4B + adaptive n).
 
 ---
 
-## 7.5 Denenip işe yaramayan / geri alınan değişiklikler
+## 7.5 Tried and reverted / failed approaches
 
-Şeffaflık için: kazançlar kadar başarısızlıklar da kayda alındı. Negatif sonuçlar gelecek
-oturumlarda aynı yola girilmesini önler.
+For transparency: failures are recorded as well as wins. Negative results prevent the same path being taken again in future sessions.
 
-### A. Faz 1 — Incremental K/V upload + mask delta (geri alındı)
+### A. Phase 1 — Incremental K/V upload + mask delta (reverted)
 
-**Hipotez:** Her round'da TÜM `acc->k_full` (~2-3 MB) GPU'ya yükleniyor. Sadece YENİ pozisyonları
-(1-3 token) yüklesek round başı ~3-5ms tasarruf, E2B chat 114 → 130-140 t/s.
+**Hypothesis:** Every round, the FULL `acc->k_full` (~2-3 MB) is uploaded to GPU. Uploading only NEW positions (1-3 tokens) would save ~3-5 ms/round, E2B chat 114 → 130-140 t/s.
 
-**Uygulanan değişiklik (~80 satır, `src/llama-graph.{h,cpp}` + `set_input` refactor):**
-- `llm_graph_input_assistant_kv`'ye `prev_n_kv_*_uploaded`, `prev_mask_*_actual`, `first_call_after_alloc` state
-- İlk çağrı: full init. Sonraki: `ggml_backend_tensor_set` ile sadece `[prev..new)` aralığı
-- Mask delta: sadece değişen `[prev_actual..new_actual)` range güncelle
-- Bucket min 256 → 1024 değişikliği de bundle'a dahil edildi
+**Change implemented (~80 lines, `src/llama-graph.{h,cpp}` + `set_input` refactor):**
+- `prev_n_kv_*_uploaded`, `prev_mask_*_actual`, `first_call_after_alloc` state added to `llm_graph_input_assistant_kv`
+- First call: full init. Subsequent: only `[prev..new)` range via `ggml_backend_tensor_set`
+- Mask delta: only update `[prev_actual..new_actual)` range
+- Bucket min 256 → 1024 change also bundled
 
-**Ölçüm sonucu (E2B chat primes n=5, baseline 51 t/s):**
-- Önceden (cf9d17f, rebuild fix): **114.7 t/s**
-- Faz 1 (incremental + bucket 1024): **99.7 t/s** (-13%) — YAVAŞ
-- Faz 1 (incremental + bucket 256): **111.6 t/s** (-3%) — marjinal yavaş
+**Measurement result (E2B chat primes n=5, baseline 51 t/s):**
+- Before (cf9d17f, rebuild fix): **114.7 t/s**
+- Phase 1 (incremental + bucket 1024): **99.7 t/s** (-13%) — SLOWER
+- Phase 1 (incremental + bucket 256): **111.6 t/s** (-3%) — marginally slower
 
-**Kök sebep:**
-1. **Bucket 1024 cap-büyütmesi attention compute'unu ~4× artırdı.** Mask -INF unused pozisyonlar
-   için softmax sıfırlasa da `Q @ K^T` matmul tüm cap pozisyonları için çalışır.
-   n_kv=50 actual, cap=1024 → matmul 1024 üzerinden = ~20× boş compute → +4-5 ms/round.
-2. **Incremental upload byte tasarrufu ≠ time tasarrufu.** `ggml_backend_tensor_set` call başına
-   CPU-side sync overhead ~50-200μs. Önceden 6 büyük call → 600μs. Faz 1: 8 küçük call → 800μs.
-   Byte ~10x küçüldü ama call SAYISI arttı (mask için per-token-row). Net: yavaş.
+**Root cause:**
+1. **Bucket 1024 cap-grow increased attention compute ~4×.** Mask -INF zeros softmax for unused positions but `Q @ K^T` matmul runs over all cap positions. n_kv=50 actual, cap=1024 → matmul over 1024 = ~20× empty compute → +4-5 ms/round.
+2. **Incremental upload byte savings ≠ time savings.** `ggml_backend_tensor_set` has CPU-side sync overhead ~50-200μs per call. Before: 6 large calls → 600μs. Phase 1: 8 small calls → 800μs. Bytes shrank ~10× but call COUNT increased (per-token-row for masks). Net: slower.
 
-**Karar:** `git checkout HEAD -- ...` ile geri alındı. cf9d17f (rebuild fix + bucket 256, full upload)
-optimal nokta.
+**Decision:** Reverted with `git checkout HEAD -- ...`. cf9d17f (rebuild fix + bucket 256, full upload) is optimal.
 
-**Ders:** Small-data regiminde call overhead bytes'tan baskın. Optimization yapılırken
-**call count + bytes** ikisi birden minimize edilmeli. Faz 1 sadece bytes'ı azalttı.
+**Lesson:** In small-data regime, call overhead dominates bytes. When optimizing, minimize **call count + bytes** both. Phase 1 only reduced bytes.
 
-### B. Bucket min 1024 (deneme, geri alındı)
+### B. Bucket min 1024 (tried, reverted)
 
-Pre-warm avantajı için bucket min'i 256→1024 yapıldı. Sonuç: short-context turn'lerde
-attention compute ~4× boş çalıştı → çıktı yavaşladı. 256 sweet spot.
+Bucket min changed 256→1024 for pre-warm advantage. Result: attention compute ran ~4× empty on short-context turns → slower output. 256 is the sweet spot.
 
-### C. Q8 draft assistant (test edildi, kazanç yok)
+### C. Q8 draft assistant (tested, no gain)
 
-**Hipotez:** F16 draft (174 MB) → Q8 (100 MB) → memory bandwidth halve → draft forward ~%30
-hızlı → E4B SD +%10-15.
+**Hypothesis:** F16 draft (174 MB) → Q8 (100 MB) → memory bandwidth halved → draft forward ~30% faster → E4B SD +10-15%.
 
-**Test sonucu (E4B chat, draft-max 3):**
+**Test result (E4B chat, draft-max 3):**
 | Prompt | F16 t/s | Q8 t/s | Δ |
 |--------|--------:|-------:|--:|
-| Primes 50 | 74.3 | 75.0 | +0.7 (gürültü) |
-| Python reverse | 50.2 | 48.5 | -1.7 (gürültü) |
-| TCP açıklama | 33.3 | 31.8 | -1.5 (gürültü) |
+| Primes 50 | 74.3 | 75.0 | +0.7 (noise) |
+| Python reverse | 50.2 | 48.5 | -1.7 (noise) |
+| TCP explanation | 33.3 | 31.8 | -1.5 (noise) |
 
-**acc rate** F16 ve Q8'de aynı (%99 / %59 / %25). Centroid head precision Q8'de bozulmamış.
+**acc rate** identical for F16 and Q8 (99% / 59% / 25%). Centroid head precision unaffected by Q8.
 
-**Kök sebep:**
-- Draft model çok küçük (78M params, 174 MB F16). Per-forward ~1-2 ms. Bandwidth-bound değil
-  **compute/launch-overhead-bound** Metal'de.
-- Round'da draft cost zaten küçük pay (~%10). Halve etsen tasarruf round'un %5'i.
+**Root cause:**
+- Draft model very small (78M params, 174 MB F16). Per-forward ~1-2 ms. Not bandwidth-bound but **compute/launch-overhead-bound** on Metal.
+- Draft cost is already a small share of the round (~10%). Halving it saves 5% of the round.
 
-**Karar:** Q8 sadece disk/RAM tasarrufu (75 MB), hız aynı. F16 kalıyor (varsayılan).
+**Decision:** Q8 is only for disk/RAM savings (75 MB), speed identical. F16 stays (default).
 
-### D. Tier 3 (GPU-persistent K/V buffer) — analiz edildi, henüz uygulanmadı
+### D. Tier 3 (GPU-persistent K/V buffer) — analyzed, not yet implemented
 
-**Beklenen kazanç hesabı:**
-- E4B primes (%99 acc, şu an 74 t/s)
-- Teorik max (round başı maliyet sıfır): ~90 t/s (round = 35 ms verify + 9 ms draft, 4 token/round)
-- 74/90 = **%82 teorik max'a yakın** zaten
-- Tier 3 sadece K/V upload + sync overhead'ini eler (~3-5 ms/round). Beklenen 74 → 80 t/s = **+%8**
+**Expected gain calculation:**
+- E4B primes (99% acc, currently 74 t/s)
+- Theoretical max (zero round-start cost): ~90 t/s (round = 35 ms verify + 9 ms draft, 4 tokens/round)
+- 74/90 = **82% of theoretical max already**
+- Tier 3 only eliminates K/V upload + sync overhead (~3-5 ms/round). Expected 74 → 80 t/s = **+8%**
 
-**ROI:** ~150 LOC + ggml backend buffer ownership + scheduler etkileşim riski karşılığında %8.
+**ROI:** ~150 LOC + ggml backend buffer ownership + scheduler interaction risk for 8%.
 Modest.
 
-**3× hedefine ulaşmaz.** Yapısal görevde 2.6× → ~2.8× yapar. 3×'e gelmek için MEDUSA tarzı
-tree drafting (~500 LOC, büyük redesign) ya da daha hızlı draft model arch gerek.
+**Won't reach 3×.** On structured tasks 2.6× → ~2.8×. To hit 3× would need MEDUSA-style tree drafting (~500 LOC, large redesign) or a faster draft model arch.
 
-**Karar:** Şimdilik ertelendi. Yapılabilir ama meyve modest, risk var.
+**Decision:** Deferred for now. Doable but yield modest, risk present.
 
-### E. Faz 1 pre-warm bucket transitions (Tier 4-A) — yapılmadı
+### E. Phase 1 pre-warm bucket transitions (Tier 4-A) — not done
 
-İlk turn'de gizli warm-up'la bucket 256/512/1024 hepsini reserve et → kullanıcı ilk turn'de
-delay yaşamaz. UX iyileştirmesi, hız etkisi yok. Faz 1 başarısız olduğu için bu da uygulanmadı.
+Hidden warm-up on first turn to reserve buckets 256/512/1024 → user doesn't experience first-turn delay. UX improvement, no speed effect. Not implemented since Phase 1 failed.
 
-### F. Adaptive n_max — yapılmadı, ROI yüksek (gelecek iş)
+### F. Adaptive n_max — not done, high ROI (future work)
 
-Yaratıcı %25 acc prompt'larda SD efektif 0.98× (kayıp). Adaptive ile `acc/round < 0.5` görünce
-n→1 veya SD-off yap. Worst case 1× garanti, best case mevcut 2.6×.
+On creative 25% acc prompts, SD effective 0.98× (loss). With adaptive, when `acc/round < 0.5` → n→1 or SD-off. Worst case guaranteed 1×, best case current 2.6×.
 
-LOC: ~30. **Tier 1'in başarısızlığından sonra en pragmatik bir sonraki iş.**
+LOC: ~30. **The most pragmatic next work after Phase 1 failure.**
 
 ---
 
-## 7.8 Aktif yol haritası — sonraki 3 iş (planlandı, kodlanmadı)
+## 7.8 Active roadmap — next 3 items (planned, not coded)
 
-3× hedefine ulaşma yolunda 3 net hedeflenmiş geliştirme. Sırasıyla `6 → 3 → 1` önerilir (kazanç
-artar, risk de artar). 6 ve 3 additive — birlikte +%15-17 yapar. 1 (async) tek başına +%50
-potansiyel ama risk yüksek.
+Three targeted improvements on the path to 3×. Recommended order `6 → 3 → 1` (gains increase, so does risk). 6 and 3 are additive — together +15-17%. 1 (async) alone has +50% potential but high risk.
 
 ---
 
-### TODO-A — Centroid head GPU-side (önerilen ilk iş)
+### TODO-A — Centroid head GPU-side (recommended first)
 
-**Mevcut sorun:**
-Her draft step sonrası host'ta `masked_argmax`:
-- `llama_get_logits_ith` ile dense logits GPU→CPU transfer (~262K × 4 = 1 MB) ~0.5 ms
-- 262K vocab scan ile token_to_cluster lookup ~0.3-0.5 ms
-- Per draft step ~1 ms, 5 draft × 5 ms/round = round'un %10'u
+**Current problem:**
+After each draft step, host-side `masked_argmax`:
+- Dense logits GPU→CPU transfer via `llama_get_logits_ith` (~262K × 4 = 1 MB) ~0.5 ms
+- 262K vocab scan with token_to_cluster lookup ~0.3-0.5 ms
+- ~1 ms per draft step, 5 draft × 5 ms/round = 10% of round
 
-**Çözüm:** Argmax'i GPU'da hesapla, sadece tek `int32 best_token_id` host'a iner.
+**Solution:** Compute argmax on GPU, only a single `int32 best_token_id` comes to host.
 
-İki seçenek:
+Two options:
 
-**A1. ggml ops kompozisyonu (portable, +50 LOC daha):**
+**A1. ggml ops composition (portable, +50 LOC more):**
 ```cpp
-// graph build sırasında:
+// during graph build:
 auto centroid_top_k_idx = ggml_top_k(centroid_logits, /*k=*/32);
-// token_to_cluster ters lookup: cluster_id'leri token id'ye genişlet
-// (precomputed lookup table tensor olarak upload edilir, ggml_get_rows)
+// reverse lookup: expand cluster_ids to token ids
+// (precomputed lookup table tensor uploaded, ggml_get_rows)
 auto sel_token_ids = ggml_get_rows(cluster_to_tokens_table, centroid_top_k_idx);  // [32×128, 1]
 auto sel_logits   = ggml_get_rows(dense_logits, sel_token_ids);                    // [4096, 1]
 auto best_local   = ggml_argmax(sel_logits);                                       // [1]
 auto best_global  = ggml_get_rows(sel_token_ids, best_local);                      // [1] = token id
-res->t_argmax = best_global;  // host bu tek int32'i okur
+res->t_argmax = best_global;  // host reads this single int32
 ```
 
-`cluster_to_tokens_table` = `token_ordering` reshape edilmiş hali, halihazırda yüklü.
+`cluster_to_tokens_table` = reshaped `token_ordering`, already loaded.
 
 **A2. Custom Metal kernel (+30 LOC shader + ~80 LOC C++ wrapper):**
-Daha az ggml op, daha hızlı ama Metal'e özel (CUDA için ayrı yazılır).
+Fewer ggml ops, faster but Metal-specific (separate write for CUDA).
 
-**Beklenen etki:**
-- E4B yapısal %99 acc: 74 → ~80 t/s (+%8)
-- E2B yapısal: 114 → ~120 t/s (+%5)
-- Yaratıcı %25 acc: marjinal (5 draft step zaten az)
+**Expected impact:**
+- E4B structured 99% acc: 74 → ~80 t/s (+8%)
+- E2B structured: 114 → ~120 t/s (+5%)
+- Creative 25% acc: marginal (5 draft steps is already few)
 
 **LOC:** ~80-150 (A1 portable, A2 Metal-specific)
-**Risk:** Orta — ggml top_k + get_rows + argmax compose; F32/F16 dispatch dikkati gerek.
-**Süre:** 1-2 gün geliştirme + test
+**Risk:** Medium — compose ggml top_k + get_rows + argmax; need care with F32/F16 dispatch.
+**Time:** 1-2 days development + test
 
-**Değişen dosyalar:**
-- `src/models/gemma4_assistant.cpp` (graph build sonuna argmax compose)
-- `src/llama-graph.h` (res->t_argmax çıktısı)
-- `examples/chat/chat.cpp` ve `examples/spec/spec.cpp` (`llama_get_logits_ith` yerine yeni
-  accessor `llama_get_assistant_argmax`)
+**Changed files:**
+- `src/models/gemma4_assistant.cpp` (argmax compose appended to graph build)
+- `src/llama-graph.h` (res->t_argmax output)
+- `examples/chat/chat.cpp` and `examples/spec/spec.cpp` (new accessor `llama_get_assistant_argmax` instead of `llama_get_logits_ith`)
 - `src/llama-context.cpp` (argmax tap host buffer)
 
 ---
 
 ### TODO-B — Tier 3 GPU-persistent K/V buffer (additive after A)
 
-**Mevcut sorun:**
-`set_input` her round'da TÜM acc K/V'yi GPU'ya re-upload eder (~3-5 MB):
-- 4 ayrı `ggml_backend_tensor_set` çağrısı (K_full, V_full, K_swa, V_swa)
-- + 2 mask upload
-- Toplam 6 sync call, ~3-5 ms/round CPU-side overhead
+**Current problem:**
+`set_input` re-uploads ALL acc K/V to GPU every round (~3-5 MB):
+- 4 separate `ggml_backend_tensor_set` calls (K_full, V_full, K_swa, V_swa)
+- + 2 mask uploads
+- Total 6 sync calls, ~3-5 ms/round CPU-side overhead
 
-Faz 1'de "incremental delta" denedim (sadece yeni byte'lar) ama ggml-alloc'un input
-tensor'larını yer değiştirebilmesi ve call sayısının artması yüzünden başarısız oldu.
+Phase 1 tried "incremental delta" (only new bytes) but failed because ggml-alloc can relocate input tensors and call count increased. 
 
-**Çözüm:** K/V buffer'ı ggml-alloc kontrolünden çıkar:
+**Solution:** Take K/V buffer out of ggml-alloc control:
 
 ```cpp
 // llama_context member
-ggml_backend_buffer_t persistent_kv_buf;     // bizim sahibimiz, ggml-alloc dokunmaz
+ggml_backend_buffer_t persistent_kv_buf;     // we own this, ggml-alloc won't touch it
 
-// init (bir kerelik):
+// init (one-time):
 const size_t kv_bytes = max_bucket * (head_dim_full*nhkv*2 + head_dim_swa*nhkv*2) * sizeof(float);
 persistent_kv_buf = ggml_backend_buft_alloc_buffer(buft, kv_bytes);
 
-// graph input artık VIEW:
+// graph input now a VIEW:
 inp->k_full = ggml_view_tensor(ctx, persistent_kv_buf, offset=0, shape=[hd_full, nhkv, n_ctx]);
-// ggml-alloc buna dokunmaz — view of external buffer
+// ggml-alloc won't touch this — view of external buffer
 
-// set_input (her round):
+// set_input (each round):
 const int64_t prev = prev_n_kv_full_uploaded;
 const int64_t now  = akv->n_kv_full;
 if (now > prev) {
-    // sadece yeni token'ların byte'larını upload
+    // upload only new tokens' bytes
     const size_t off   = prev * stride * sizeof(float);
     const size_t bytes = (now - prev) * stride * sizeof(float);
     ggml_backend_tensor_set(inp->k_full, akv->k_full.data() + prev*stride, off, bytes);
@@ -716,46 +622,41 @@ if (now > prev) {
 prev_n_kv_full_uploaded = now;
 ```
 
-GPU buffer **kalıcı** — eski pozisyonlar dokunulmaz, sadece yeni yazılır. Bucket büyürse
-buffer realloc (session başına ~5 kez, ucuz).
+GPU buffer is **persistent** — old positions untouched, only new written. Buffer reallocs when bucket grows (~5 times per session, cheap).
 
-**Faz 1'den fark:** Faz 1'de ggml-alloc managed buffer'a delta yapmaya çalıştık → buffer
-adresi değişebildiği için her bucket grow'da full re-upload zorunlu kaldı + per-call
-overhead arttı. Tier 3'te buffer **bizim**, adres sabit → gerçek append-only.
+**Difference from Phase 1:** Phase 1 tried delta on ggml-alloc managed buffer → buffer address could change on every bucket grow, full re-upload still required + per-call overhead increased. Tier 3 buffer is **ours**, address fixed → true append-only.
 
-**Beklenen etki:**
-- E4B yapısal %99 acc: 80 (TODO-A sonrası) → ~85 t/s (+%6)
-- E2B yapısal: 120 → ~123 t/s (+%3)
-- Yaratıcı: marjinal (~+1 t/s)
+**Expected impact:**
+- E4B structured 99% acc: 80 (after TODO-A) → ~85 t/s (+6%)
+- E2B structured: 120 → ~123 t/s (+3%)
+- Creative: marginal (~+1 t/s)
 
-**TODO-A + TODO-B birlikte:** E4B 74 → ~85 t/s (+%15) → **3× hedefine %95 yakınlık**.
+**TODO-A + TODO-B together:** E4B 74 → ~85 t/s (+15%) → **95% of 3× target**.
 
 **LOC:** ~150
-**Risk:** Orta-yüksek — ggml view tensor + scheduler external buffer etkileşim nuanslı.
-"External tensor view" semantic ggml dökümantasyonunda kısmi.
-**Süre:** 2-3 gün + bol test
+**Risk:** Medium-high — ggml view tensor + scheduler external buffer interaction is nuanced. "External tensor view" semantics partially documented in ggml.
+**Time:** 2-3 days + extensive testing
 
-**Değişen dosyalar:**
+**Changed files:**
 - `src/llama-context.{h,cpp}` (persistent_kv_buf member, init, destructor cleanup)
 - `src/llama-graph.{h,cpp}` (build_inp_assistant_kv view-based; set_input delta upload)
 - Bucket grow path (persistent buffer realloc)
 
 ---
 
-### TODO-C — Async draft/verify pipeline (big bet, 3×'i geçer)
+### TODO-C — Async draft/verify pipeline (big bet, exceeds 3×)
 
-**Mevcut sorun:**
-Round sequential — draft ve verify peş peşe:
+**Current problem:**
+Round is sequential — draft and verify back-to-back:
 
 ```
 Round N:   [draft 9ms][verify 35ms][tap 3ms][accept 1ms]   total 48ms
-Round N+1: bekler...     [draft 9ms][verify 35ms]...        total 48ms
+Round N+1: waiting...    [draft 9ms][verify 35ms]...        total 48ms
 ```
 
-Target verify CPU'yu meşgul etmiyor — sadece Metal'de hesaplanıyor. Bu süre boyunca CPU
-boş, draft GPU üzerinde başlayabilir.
+Target verify doesn't occupy CPU — only computing on Metal. During this time CPU is idle, draft GPU could start.
 
-**Çözüm:** Round N+1'in draft'ını round N'in verify'ı sırasında speculative başlat.
+**Solution:** Speculatively start round N+1's draft during round N's verify.
 
 ```
 Time →
@@ -764,131 +665,114 @@ Round N+1:            [draft────][verify──────────�
                       ↑ speculative start
 ```
 
-Round N+1 draft'ı round N'in **draft sonuçlarının kabul edileceğini** varsayar (acc'a o
-draftleri commit gibi davranır). Verify döndüğünde:
-- Hepsi kabul → speculative draft doğru taban → kullan
-- Bir kısmı reddedildi → draft tabanı yanlış → atıp baştan başla
+Round N+1 draft assumes round N's draft tokens will be accepted (acts as if committed to acc). When verify returns:
+- All accepted → speculative draft had correct base → use it
+- Partially rejected → draft base was wrong → discard and restart
 
-**Yüksek-acc'ta (yapısal görev) speculative tahmin neredeyse hep doğru** → her round overlap
-fayda → effective round time = max(draft, verify) = ~35ms = **+%50 hız**.
+**At high acc (structured tasks) the speculative assumption is almost always correct** → every round overlaps → effective round time = max(draft, verify) = ~35ms = **+50% speed**.
 
-**Düşük-acc'ta (yaratıcı) tahmin sık yanlış** → atılan iş → net ~0 veya hafif zarar. Adaptive
-n ile birlikte kullanılırsa düşük-acc'ta SD-off oldukça async path zaten devre dışı.
+**At low acc (creative) the assumption is often wrong** → wasted work → net ~0 or slight loss. Combined with adaptive n, at low-acc SD-off so async path is already disabled.
 
-**Beklenen etki:**
-- E4B yapısal %99 acc: 85 (A+B sonrası) → ~110-120 t/s (+%30) → **3.9× baseline**
-- E4B yapısal %60 acc: +%15
-- Yaratıcı %25 acc: ~0 (Adaptive n ile SD-off zaten)
+**Expected impact:**
+- E4B structured 99% acc: 85 (after A+B) → ~110-120 t/s (+30%) → **3.9× baseline**
+- E4B structured 60% acc: +15%
+- Creative 25% acc: ~0 (SD-off with adaptive n anyway)
 
-**Karmaşıklık:**
-1. **İki context concurrent decode** — `llama_decode` sync API; ya `std::thread` ile ayrı
-   thread'lerde, ya da ggml-sched'in `_async` varyantlarıyla aynı thread'den 2 graph'ı paralel
-   submit + sonda sync.
-2. **Speculative state rollback** — round N+1 draft'ı yanlış tabandaysa draft ctx KV'sini
-   manuel rollback (rejected positions'ı seq_rm).
-3. **Atılan iş tracking** — wasted draft sayısını stats'ta göster.
-4. **Metal command queue** — iki context'in command buffer'ları interleave; Metal scheduler
-   genelde halleder ama GPU contention ihtimali.
+**Complexity:**
+1. **Two concurrent context decodes** — `llama_decode` is sync API; either separate threads with `std::thread`, or submit 2 graphs parallel from same thread with ggml-sched `_async` variants + sync at end.
+2. **Speculative state rollback** — if round N+1 draft had wrong base, manually rollback draft ctx KV (seq_rm rejected positions).
+3. **Wasted work tracking** — show wasted draft count in stats.
+4. **Metal command queue** — two contexts' command buffers interleave; Metal scheduler generally handles this but GPU contention possible.
 
 **LOC:** ~200
-**Risk:** Çok yüksek — multi-thread sync hataları sessizdir, debug çok zor. Race condition
-sample-level bozulmaya yol açabilir (lossless garantisi tehlikede).
-**Süre:** Hafta+ geliştirme + dikkatli test (golden trace ile lossless doğrulama)
+**Risk:** Very high — multi-thread sync bugs are silent, very hard to debug. Race conditions can cause sample-level corruption (lossless guarantee at risk).
+**Time:** Week+ development + careful testing (lossless verification with golden trace)
 
-**Değişen dosyalar:**
-- `examples/chat/chat.cpp` ve `examples/spec/spec.cpp` (REPL loop double-buffer hale geldi)
-- Yeni helper: speculative draft launcher + rollback
-- llama-context (eğer concurrent decode için flag/lock gerekirse)
+**Changed files:**
+- `examples/chat/chat.cpp` and `examples/spec/spec.cpp` (REPL loop becomes double-buffered)
+- New helper: speculative draft launcher + rollback
+- llama-context (if flag/lock needed for concurrent decode)
 
-**Önkoşul:** TODO-A + TODO-B yapılmış olsa daha iyi (round overhead düşmüş olur, async kazancı
-saf draft+verify üzerine binsin).
+**Prerequisite:** Better if TODO-A + TODO-B done first (round overhead lowered, async gain sits on top of pure draft+verify).
 
 ---
 
-### Özet tablo
+### Summary table
 
-| Sıra | İş | Kazanç (E4B yapısal) | LOC | Risk | Süre |
-|------|----|---------------------:|----:|------|------|
-| **1** | TODO-A: Centroid head GPU | 74→80 t/s (+%8) | 80-150 | Orta | 1-2 gün |
-| **2** | TODO-B: GPU-persistent K/V | 80→85 t/s (+%6) | 150 | Orta-yüksek | 2-3 gün |
-| **3** | TODO-C: Async pipeline | 85→110-120 t/s (+%30) | 200 | Çok yüksek | Hafta+ |
+| Order | Work | Gain (E4B structured) | LOC | Risk | Time |
+|-------|----|---------------------:|----:|------|------|
+| **1** | TODO-A: Centroid head GPU | 74→80 t/s (+8%) | 80-150 | Medium | 1-2 days |
+| **2** | TODO-B: GPU-persistent K/V | 80→85 t/s (+6%) | 150 | Medium-high | 2-3 days |
+| **3** | TODO-C: Async pipeline | 85→110-120 t/s (+30%) | 200 | Very high | Week+ |
 
-**A+B birlikte: ~%15 kazanç, ~%95 3× hedefine.**
-**A+B+C birlikte: ~%50 kazanç, 3.9× baseline (3× hedefini geçer).**
+**A+B together: ~15% gain, ~95% of 3× target.**
+**A+B+C together: ~50% gain, 3.9× baseline (exceeds 3× target).**
 
 ---
 
-## 7.7 Git commit ilerleyişi
+## 7.7 Git commit history
 
 ```
-3b32d89 first commit                              ← only-needed-files baz iskelet
-933afd0 tool,agent loop, speculative decoding     ← SD port + chat + tool (Aşama 2+3)
-8bb9fb4 bug fix                                   ← 3 bug fix (cache exhaustion + prefill + gen=0)
-cf9d17f hızlandırma                               ← Graph rebuild fix (bucketed cap + mask)
+3b32d89 first commit                              ← only-needed-files base skeleton
+933afd0 tool,agent loop, speculative decoding     ← SD port + chat + tool (Phase 2+3)
+8bb9fb4 bug fix                                   ← 3 bug fixes (cache exhaustion + prefill + gen=0)
+cf9d17f speedup                                   ← Graph rebuild fix (bucketed cap + mask)
                                                     → E2B 57→114 t/s, E4B 30→74 t/s = 2.25-2.63×
-d5ecbf1 deneme                                    ← Faz 1 incremental upload denemesi (geri alındı)
+d5ecbf1 experiment                                ← Phase 1 incremental upload attempt (reverted)
 ```
 
-Şu an working tree = `cf9d17f hızlandırma` (en iyi sonuç).
+Current working tree = `cf9d17f speedup` (best result).
 
 ---
 
-## 7b. Bug Raporu — Tool Hop KV Misalignment (2026-05-30)
+## 7b. Bug Report — Tool Hop KV Misalignment (2026-05-30)
 
-### Semptom
+### Symptom
 
-`llama-chat` ile file okuma tool çağrısı yapıldığında, ikinci hop (tool response sonrası model
-yanıtı) her zaman "I cannot access the file" şeklinde hata veriyordu. Dosya var, sandbox geçiyor,
-`realpath` çalışıyor. `[tool] read_file(path=...)` logu yazılıyordu. Model yine de fail diyordu.
+When a file-reading tool call was made with `llama-chat`, the second hop (model response after tool response) always returned "I cannot access the file". File exists, sandbox passes, `realpath` works. `[tool] read_file(path=...)` was being logged. Model still said it failed.
 
 ### Root cause
 
-**Token `<tool_call|>` KV cache'e yazılmadan break yapılıyordu.**
+**The `<tool_call|>` token was break-ing before being written to KV cache.**
 
 #### Greedy path (`!sd_on`):
 
 ```cpp
 // BUG — original code
-if (assistant_text.find("<tool_call|>") != std::string::npos) { break; }  // ← ÖNCE break
+if (assistant_text.find("<tool_call|>") != std::string::npos) { break; }  // ← break FIRST
 //
 batch.token[0] = id;  ...
-llama_decode(ctx, batch);   // ← SONRA decode, ama hiç çalışmıyor
+llama_decode(ctx, batch);   // ← decode SECOND, but never runs
 kv_pos++;
 ```
 
-`<tool_call|>` token'ı `piece()` ile emit edilip `assistant_text`'e ekleniyor, sonra KV'ye
-yazılmadan break. `last_formatted = formatted + assistant_text` string olarak `<tool_call|>`
-içeriyor ama `kv_pos` bir pozisyon geride.
+`<tool_call|>` token emitted via `piece()` and added to `assistant_text`, then break before writing to KV. `last_formatted = formatted + assistant_text` contains `<tool_call|>` as a string but `kv_pos` is one position behind.
 
-İkinci hop'un tail'i:
+Second hop's tail:
 ```
 last_formatted  = "...<|turn>model\n<|tool_call>...{path:...}<tool_call|>"   ← string
-KV gerçeği      = "...<|turn>model\n<|tool_call>...{path:...}"               ← son tok eksik
+KV reality      = "...<|turn>model\n<|tool_call>...{path:...}"               ← last tok missing
 ```
 
 Tail = `formatted2.substr(last_formatted.size())` = `"<turn|>\n<|turn>user\n<|tool_response>..."`.
 
-Bu tail `kv_pos`'tan feed'lenince, position `kv_pos` context'inde modelin beklediği
-`<tool_call|>` yok — onun yerine direkt `<turn|>` geliyor. Model corrupted context görüyor →
-tool response'u algılayamıyor → hallucinate "cannot access".
+This tail fed from `kv_pos` has no `<tool_call|>` at position `kv_pos` in context — instead gets `<turn|>` directly. Model sees corrupted context → can't recognize tool response → hallucinates "cannot access".
 
 #### SD path (`sd_on`):
 
-SD'de `emit` lambda tool_seen=true set ediyor ama Step 6 (KV advance) her zaman çalışıyor:
+In SD, `emit` lambda sets tool_seen=true but Step 6 (KV advance) always runs:
 
-- **Case B** (`next_pending = <tool_call|>`): next_pending decode edilmeden next round'a geçilir.
-  Step 6 `acc_nkv += n_accept + 1` yapıyor ama `<tool_call|>` KV'de yok.
-  `kv_pos < want_kv` → eksik token.
+- **Case B** (`next_pending = <tool_call|>`): next_pending decoded before next round. Step 6 does `acc_nkv += n_accept + 1` but `<tool_call|>` not in KV.
+  `kv_pos < want_kv` → missing token.
 
-- **Case D** (accepted draft içinde `<tool_call|>`): drafted[j]=`<tool_call|>` KV'de var ama
-  drafted[j+1..n_accept-1] da KV'de var (ghost token'lar). Step 6 `n_accept+1` ilerliyor.
-  `kv_pos > want_kv` → ghost token'lar.
+- **Case D** (accepted draft contains `<tool_call|>`): drafted[j]=`<tool_call|>` is in KV but drafted[j+1..n_accept-1] also in KV (ghost tokens). Step 6 advances by `n_accept+1`.
+  `kv_pos > want_kv` → ghost tokens.
 
-Her iki case'de ikinci hop tail'i yanlış pozisyondan başlıyor → same corruption.
+Both cases: second hop tail starts from wrong position → same corruption.
 
 ### Fix (`examples/chat/chat.cpp`)
 
-**Greedy path** — break'i decode'dan SONRAYA taşı:
+**Greedy path** — move break to AFTER decode:
 
 ```cpp
 // FIX — decode first, break after
@@ -896,142 +780,130 @@ batch.token[0] = id;  batch.pos[0] = kv_pos;  ...  batch.logits[0] = 1;
 llama_decode(ctx, batch);
 kv_pos++;
 
-if (assistant_text.find("<tool_call|>") != std::string::npos) { break; }  // ← SONRA
+if (assistant_text.find("<tool_call|>") != std::string::npos) { break; }  // ← AFTER
 ```
 
-**SD path** — while loop sonunda `tool_seen` ise KV hizalama:
+**SD path** — KV alignment after while loop if `tool_seen`:
 
 ```cpp
 if (tool_seen) {
     const auto lf_toks = tokenize(vocab, formatted + assistant_text, true);
     const int64_t want_kv = (int64_t) lf_toks.size();
     if (kv_pos > want_kv) {
-        // Case D: ghost token'ları trim et
+        // Case D: trim ghost tokens
         llama_memory_seq_rm(ctx, 0, want_kv, -1);
         const int64_t trim = kv_pos - want_kv;
-        acc_kf.resize(... - trim*hd_full*nhkv);  // acc vektörlerini de küçült
+        acc_kf.resize(... - trim*hd_full*nhkv);  // shrink acc vectors too
         acc_vf.resize(...); acc_ks.resize(...); acc_vs.resize(...);
         kv_pos = acc_nkv = want_kv;
     } else if (kv_pos < want_kv) {
-        // Case B: eksik token'ları decode et ve tap acc'a ekle
+        // Case B: decode missing tokens and append to tap acc
         for (int64_t pos = kv_pos; pos < want_kv; ++pos) {
             batch.token[0] = lf_toks[pos];  batch.pos[0] = pos;  ...
             llama_decode(ctx, batch);
-            // llama_get_assistant_kv_tap → acc_kf/vf/ks/vs'e ekle
+            // llama_get_assistant_kv_tap → append to acc_kf/vf/ks/vs
             kv_pos++;  acc_nkv++;
         }
     }
 }
 ```
 
-### Neden daha önce fark edilmedi?
+### Why it wasn't caught earlier
 
-Test sırasında (`CHAT_TOOLS_REPORT.md` §6) `/tmp/test_chat.txt` ile tek başarılı test vardı.
-O test büyük ihtimalle Case B senaryosu değildi veya model context corruption'a o specific
-prompt için yeterince robust davrandı. Hata intermittent değil — tool hop her çağrıda fail
-ediyordu ama test sırasında tek bir denemede geçti.
+During testing (`CHAT_TOOLS_REPORT.md` §6), there was a single successful test with `/tmp/test_chat.txt`. That test was probably not a Case B scenario or the model was robust enough to handle context corruption for that specific prompt. The error was not intermittent — tool hop failed on every call, but passed once during the single test attempt.
 
-### Sonuç
+### Result
 
-Fix sonrası `<tool_call|>` her zaman KV'ye yazılıyor, ikinci hop tail'i doğru pozisyondan
-başlıyor, model tool response'ı görüyor ve doğru yanıt üretiyor.
+After fix, `<tool_call|>` is always written to KV, second hop tail starts from the correct position, model sees the tool response and produces the correct answer.
 
 ---
 
-## 7c. Bug Raporu — msg_storage Dangling Pointer (2026-05-31)
+## 7c. Bug Report — msg_storage Dangling Pointer (2026-05-31)
 
-### Semptom
+### Symptom
 
-`llama-chat` her 3. turn'de (bazen 2. turn sonunda) çöküyordu:
+`llama-chat` crashed every 3rd turn (sometimes at end of 2nd):
 
 ```
 [chat] empty tail tokenization
 [chat] decode failed during turn -> resetting (system only); next prompt starts fresh
 ```
 
-İlk 2 turn normal, 3. turn'de hiçbir çıktı yok.
+First 2 turns normal, 3rd turn produces no output.
 
 ### Root cause
 
-`push_msg` her çağrıda `msg_storage` vector'una 2 element ekliyor (role + content), sonra bu
-elementlerin `c_str()` pointer'larını `msgs` vector'una yazıyor:
+`push_msg` adds 2 elements to `msg_storage` vector per call (role + content), then writes those elements' `c_str()` pointers into the `msgs` vector:
 
 ```cpp
-std::vector<std::string> msg_storage;   // BUG: vector realloc pointer'ları invalidate eder
+std::vector<std::string> msg_storage;   // BUG: vector realloc invalidates pointers
 ...
 msg_storage.push_back(role);
 msg_storage.push_back(content);
-const char * r = msg_storage[...].c_str();   // bu pointer kaydediliyor
-const char * c = msg_storage[...].c_str();   // bu da
-msgs.push_back({ r, c });                    // msgs içinde saklanıyor
+const char * r = msg_storage[...].c_str();   // this pointer is saved
+const char * c = msg_storage[...].c_str();   // this too
+msgs.push_back({ r, c });                    // stored in msgs
 ```
 
-`std::vector` kapasitesi dolduğunda tüm elemanları yeni belleğe MOVE eder. Move sonrası
-eski `c_str()` pointer'ları dangling kalır. Capacity doubling sırası:
+When `std::vector` capacity is full, it MOVEs all elements to new memory. After move, old `c_str()` pointers become dangling. Capacity doubling sequence:
 
 ```
 push #1-2  → capacity: 2
 push #3-4  → realloc 2→4   → msgs[0] dangling
 push #5-8  → realloc 4→8   → msgs[0..1] dangling
-push #9    → realloc 8→16  → msgs[0..3] dangling  ← 3. turn'deki crash buradan
+push #9    → realloc 8→16  → msgs[0..3] dangling  ← crash on turn 3 comes from here
 ```
 
-9. element push'u turn 2'nin assistant cevabı push'unda gerçekleşiyor. Ardından `apply_template`
-dangling pointer'ları okuyunca `formatted` string yanlış uzunlukta ya da içeriksiz çıkıyor.
-Sonuç: `formatted.size() <= last_formatted.size()` → `tail = ""` → `tail_tokens.empty()` → hata.
+The 9th element push happens during turn 2's assistant response push. Then `apply_template` reads dangling pointers → `formatted` string comes out wrong length or empty. Result: `formatted.size() <= last_formatted.size()` → `tail = ""` → `tail_tokens.empty()` → error.
 
 ### Fix
 
-`std::vector` → `std::deque`. `deque::push_back` mevcut elementlere pointer/reference'ları
-**hiçbir zaman invalidate etmez** (sadece iterator'ları eder). `c_str()` pointer'ları güvende kalır.
+`std::vector` → `std::deque`. `deque::push_back` **never invalidates** existing element pointers/references (only invalidates iterators). `c_str()` pointers are safe.
 
 ```cpp
-// ÖNCE (bug):
+// BEFORE (bug):
 std::vector<std::string> msg_storage;
 
-// SONRA (fix):
+// AFTER (fix):
 std::deque<std::string>  msg_storage;  // push_back never invalidates existing c_str() pointers
 ```
 
-`#include <deque>` eklendi. API aynı — başka kod değişmedi.
+Added `#include <deque>`. API unchanged — no other code changes.
 
-### Neden geç fark edildi
+### Why it was caught late
 
-İlk testler tek-shot veya 1-2 turn'deydi; bug turn 3'te tetikleniyordu. Reset sonrası "next prompt
-starts fresh" mesajı çalışıyordu çünkü reset_chat msg_storage'ı `clear()` + yeniden dolduruyordu
-(fresh pointer'larla) — yani reset her seferinde bug'ı geçici olarak "gizliyordu."
+Initial tests were single-shot or 1-2 turns; bug triggered on turn 3. After reset, "next prompt starts fresh" message worked because `reset_chat` does `clear()` + refills `msg_storage` (fresh pointers) — so reset was temporarily "hiding" the bug each time.
 
 ---
 
 ## 7d. KV Cache Q8 Default (2026-05-30)
 
-### Değişiklik
+### Change
 
-`llama-chat` artık KV cache'i varsayılan olarak **q8_0** formatında saklar (önceden f16).
-Dışarıdan hiçbir bağımlılık yok — quantization kodu tamamen `only-needed-files` içinde:
+`llama-chat` now stores KV cache in **q8_0** format by default (previously f16). No external dependencies — quantization code entirely within `only-needed-files`:
 
-| Dosya | Rol |
-|-------|-----|
-| `ggml/include/ggml.h:398` | `GGML_TYPE_Q8_0 = 8` tip tanımı |
-| `src/llama-kv-cache.cpp:210-211` | KV tensor'larını `type_k`/`type_v` ile oluşturma |
-| `src/llama-kv-cache.cpp:56` | `ggml_quantize_chunk` — yazarken q8'e sıkıştır |
-| `src/llama-kv-cache.cpp:1748-1749` | RoPE için dequantize → f32 → quantize geri |
+| File | Role |
+|------|------|
+| `ggml/include/ggml.h:398` | `GGML_TYPE_Q8_0 = 8` type definition |
+| `src/llama-kv-cache.cpp:210-211` | Create KV tensors with `type_k`/`type_v` |
+| `src/llama-kv-cache.cpp:56` | `ggml_quantize_chunk` — compress to q8 on write |
+| `src/llama-kv-cache.cpp:1748-1749` | Dequantize → f32 → quantize back for RoPE |
 
-### Bellek etkisi
+### Memory impact
 
-| `-c` | f16 (eski) | q8 (yeni) | kazanım |
-|------|-----------|-----------|---------|
+| `-c` | f16 (old) | q8 (new) | saving |
+|------|-----------|-----------|--------|
 | 4096 | ~250 MB | ~125 MB | 2× |
 | 8192 | ~500 MB | ~250 MB | 2× |
 | 16384 | ~1 GB | ~500 MB | 2× |
 
-### Kod değişikliği (`examples/chat/chat.cpp`)
+### Code change (`examples/chat/chat.cpp`)
 
 ```cpp
 // args struct:
-bool kv_q8 = true;   // varsayılan q8; --kv-f16 ile f16'ya dön
+bool kv_q8 = true;   // default q8; revert to f16 with --kv-f16
 
-// context oluşturma:
+// context creation:
 if (a.kv_q8) {
     cp.type_k = GGML_TYPE_Q8_0;
     cp.type_v = GGML_TYPE_Q8_0;
@@ -1040,40 +912,33 @@ if (a.kv_q8) {
 
 ### Flag
 
-`--kv-f16` → q8'i kapat, f16'ya dön (hata ayıklama veya kalite karşılaştırması için).
+`--kv-f16` → disable q8, switch to f16 (for debugging or quality comparison).
 
-### Kalite etkisi
+### Quality impact
 
-K ve V vektörleri 8-bit integer olarak saklanır. Attention output üzerindeki etkisi minimal
-(ağırlıklar değil, aktivasyonlar sıkıştırılıyor). Pratik: acceptance rate ve t/s değerleri
-f16 ile aynı kalır.
+K and V vectors stored as 8-bit integers. Effect on attention output is minimal (activations compressed, not weights). In practice: acceptance rate and t/s values remain the same as f16.
 
 ---
 
-## 8. Bilinen sınırlamalar / out of scope
+## 8. Known limitations / out of scope
 
-1. **Sadece gemma-4 hedefli.** Diğer model'lerin chat template'leri için legacy hand-coded
-   path'leri çalışır ama tool calling için gemma-4'e özel.
-2. **jinja yok** — only-needed-files prensibi gereği. Yeni gemma türevleri için template
-   manuel eklemek gerekir.
-3. **Tool'lar read-only.** `write_file`/`bash` yok (güvenlik). Eklenebilir aynı sandbox guard ile.
-4. **Tek-tool-per-turn.** Paralel tool çağrıları yok.
-5. **Tool arg parsing tek `path` argümanı için optimize.** Multi-arg tool'lar için genişletme
-   gerek.
-6. **Greedy sampling sabit.** Top-k/temperature yok. Eklemek için `llama_sampler` kullanılabilir.
-7. **Geliştirme persistence yok.** Program kapanınca history kaybolur. Tüm verbose log
-   `logs/session-*.log` dosyasında.
-8. **Adaptive n yok** (yukarıda önerildi).
-9. **Per-round graph rebuild kaldırılmadı** (yukarıda önerildi).
-10. **History rotation kayıp veri demek.** Cache dolunca eski mesajlar atılır; model önceki
-    bağlamı hatırlamaz. Daha akıllı: summarize-then-evict (gelecek iş).
+1. **Gemma-4 only.** Legacy hand-coded paths work for other models' chat templates but tool calling is gemma-4 specific.
+2. **No jinja** — by only-needed-files principle. Adding new gemma variants requires manually adding templates.
+3. **Tools read-only.** No `write_file`/`bash` (security). Can be added with same sandbox guard.
+4. **Single tool per turn.** No parallel tool calls.
+5. **Tool arg parsing optimized for single `path` arg.** Multi-arg tools need extension.
+6. **Greedy sampling fixed.** No top-k/temperature. Can use `llama_sampler` to add.
+7. **No history persistence.** History lost on program exit. All verbose logs in `logs/session-*.log`.
+8. **No adaptive n** (proposed above).
+9. **Per-round graph rebuild not eliminated** (proposed above).
+10. **History rotation means data loss.** When cache fills, old messages are dropped; model can't recall prior context. Smarter approach: summarize-then-evict (future work).
 
 ---
 
-## 9. Dosya envanteri
+## 9. File inventory
 
-| Dosya | Satır | Tip |
-|-------|------:|-----|
+| File | Lines | Type |
+|------|------:|------|
 | `src/llama-arch.{h,cpp}` | +23 | additive |
 | `src/llama-hparams.{h,cpp}` | +12 | additive |
 | `src/llama-cparams.h` | +1 | additive |
@@ -1083,50 +948,50 @@ f16 ile aynı kalır.
 | `src/llama-model.cpp` | +50 | additive |
 | `src/models/models.h` | +30 | additive |
 | `src/models/gemma4.cpp` | +50 | additive (tap) |
-| `src/models/gemma4_assistant.cpp` | 240 | **YENİ** |
+| `src/models/gemma4_assistant.cpp` | 240 | **NEW** |
 | `src/llama-chat.{h,cpp}` | +25 | additive (gemma-4 template) |
-| `examples/spec/spec.cpp` | 438 | **YENİ** |
-| `examples/spec/CMakeLists.txt` | 5 | **YENİ** |
-| `examples/chat/chat.cpp` | 631 | **YENİ** |
-| `examples/chat/CMakeLists.txt` | 5 | **YENİ** |
+| `examples/spec/spec.cpp` | 438 | **NEW** |
+| `examples/spec/CMakeLists.txt` | 5 | **NEW** |
+| `examples/chat/chat.cpp` | 631 | **NEW** |
+| `examples/chat/CMakeLists.txt` | 5 | **NEW** |
 | `CMakeLists.txt` (top) | +2 | additive |
-| **TOPLAM YENİ** | **~1830 satır** | |
+| **TOTAL NEW** | **~1830 lines** | |
 
-Eski raporlar:
-- `llama.cpp/GEMMA4_ASSISTANT_HANDOFF.md` (önceki oturum)
-- `llama.cpp/GEMMA4_ASSISTANT_FIX_REPORT.md` (SD bug fix detayı)
+Previous reports:
+- `llama.cpp/GEMMA4_ASSISTANT_HANDOFF.md` (previous session)
+- `llama.cpp/GEMMA4_ASSISTANT_FIX_REPORT.md` (SD bug fix details)
 - `llama.cpp/E2B_BENCHMARK.md` (E2B prompt sweep)
-- `only-needed-files/CHAT_TOOLS_REPORT.md` (chat + tool detayı)
-- **Bu dosya** — master / konsolide rapor
+- `only-needed-files/CHAT_TOOLS_REPORT.md` (chat + tool details)
+- **This file** — master / consolidated report
 
 ---
 
-## 10. Komutlar (referans)
+## 10. Commands (reference)
 
 ```bash
 cd /Users/enes/Desktop/all/less-llama-cpp/only-needed-files
 cd build && cmake --build . -j 8 && cd ..
 
-# Tek-shot SD (en hızlı yapısal görev için)
+# Single-shot SD (fastest for structured tasks)
 ./build/bin/llama-spec \
   -m /Users/enes/Desktop/all/llms/gemma-4-E2B-it-UD-Q8_K_XL.gguf \
   -md /Users/enes/Desktop/all/llms/gemma-4-E2B-it-assistant.F16.gguf \
   --spec-type draft-mtp --spec-draft-n-max 5 \
   -p "List the first 50 prime numbers." -n 400 -ngl 99
 
-# Multi-turn chat + tool + SD (KV q8 default — 2× bellek kazanımı)
+# Multi-turn chat + tool + SD (KV q8 default — 2× memory saving)
 ./build/bin/llama-chat \
   -m /Users/enes/Desktop/all/llms/gemma-4-E2B-it-UD-Q8_K_XL.gguf \
   -md /Users/enes/Desktop/all/llms/gemma-4-E2B-it-assistant.F16.gguf \
   -ngl 99 -c 8192 --draft-max 3
 
-# KV f16 istersen (karşılaştırma için):
+# KV f16 if desired (for comparison):
 #   ... --kv-f16
 
-# Chat tool'suz + thinking
+# Chat without tools + thinking
 ./build/bin/llama-chat -m <model> -ngl 99 --no-tools --thinking
 
-# Chat sandbox darlat
+# Chat with restricted sandbox
 ./build/bin/llama-chat -m <model> -ngl 99 --root /tmp
 
 # Baseline (regression)

@@ -1,20 +1,20 @@
-# SD vs SSD Karşılaştırma — Deney Sonuçları
+# SD vs SSD Comparison — Experiment Results
 
-Model: `gemma-4-E2B-it-UD-Q8_K_XL` (target Q8) + `gemma-4-E2B-it-assistant.F16` (draft F16)  
-Platform: Mac, Metal backend, single GPU.  
+Model: `gemma-4-E2B-it-UD-Q8_K_XL` (target Q8) + `gemma-4-E2B-it-assistant.F16` (draft F16)
+Platform: Mac, Metal backend, single GPU.
 SSD flag: `--ssd-fan-out 7` (B=7). SD = `--ssd-fan-out 1` (B=1 = off).
 
-Output her testte byte-identical (lossless). Tüm diff'ler sıfır.
+Output byte-identical in every test (lossless). All diffs zero.
 
 ---
 
-## Sonuç Tablosu
+## Results Table
 
-### draft-max=3 (K=3, B=7 > K → SSD aktif)
+### draft-max=3 (K=3, B=7 > K → SSD active)
 
 | Prompt | Mode | t/s | accept% | acc/round | hit% | extra_dec | saved | net_extra |
 |---|---|---|---|---|---|---|---|---|
-| primes (40 prime) | SD | **110.7** | 94.0 | 2.82 | — | 0 | 0 | 0 |
+| primes (40 primes) | SD | **110.7** | 94.0 | 2.82 | — | 0 | 0 | 0 |
 | primes | SSD B=7 | 92.3 | 94.0 ✓ | 2.82 | 33 | 168 | 1 | +167 |
 | count (1-60) | SD | **101.9** | 81.9 | 2.46 | — | 0 | 0 | 0 |
 | count | SSD B=7 | 80.1 | 81.9 ✓ | 2.46 | 44 | 164 | 4 | +160 |
@@ -23,7 +23,7 @@ Output her testte byte-identical (lossless). Tüm diff'ler sıfır.
 | coding (fibonacci) | SD | **49.4** | 20.3 | 0.61 | — | 0 | 0 | 0 |
 | coding | SSD B=7 | 38.9 | 18.9 ✓ | 0.57 | 19 | 324 | 14 | +310 |
 
-### draft-max=5 (K=5, B=7 > K → SSD aktif)
+### draft-max=5 (K=5, B=7 > K → SSD active)
 
 | Prompt | Mode | t/s | accept% | acc/round | hit% | extra_dec | saved | net_extra |
 |---|---|---|---|---|---|---|---|---|
@@ -36,71 +36,71 @@ Output her testte byte-identical (lossless). Tüm diff'ler sıfır.
 | coding | SD | **39.1** | 12.6 | 0.63 | — | 0 | 0 | 0 |
 | coding | SSD B=7 | 33.9 | 11.7 ✓ | 0.59 | 16 | 189 | 12 | +177 |
 
-### draft-max=7 (K=7, B=7 = K → SSD otomatik kapalı)
+### draft-max=7 (K=7, B=7 = K → SSD automatically off)
 
-| Prompt | Mode | t/s | accept% | hit% | Açıklama |
+| Prompt | Mode | t/s | accept% | hit% | Note |
 |---|---|---|---|---|---|
 | primes | SD | 96.5 | 61.7 | 0 | — |
-| primes | SSD B=7 | 98.8 | 61.7 | 0 | B=K → alts yok |
+| primes | SSD B=7 | 98.8 | 61.7 | 0 | B=K → no alts |
 | count | SD | 78.5 | 47.4 | 0 | — |
-| count | SSD B=7 | 78.1 | 47.4 | 0 | B=K → alts yok |
+| count | SSD B=7 | 78.1 | 47.4 | 0 | B=K → no alts |
 | creative | SD | 32.9 | 10.1 | 0 | — |
-| creative | SSD B=7 | 32.4 | 10.1 | 0 | B=K → alts yok |
+| creative | SSD B=7 | 32.4 | 10.1 | 0 | B=K → no alts |
 | coding | SD | 30.9 | 9.0 | 0 | — |
-| coding | SSD B=7 | 30.6 | 9.0 | 0 | B=K → alts yok |
+| coding | SSD B=7 | 30.6 | 9.0 | 0 | B=K → no alts |
 
 ---
 
-## Ana Bulgular
+## Key Findings
 
-### 1. Losslessness — Her Testte Sağlandı
-`diff SD_output SSD_output` → her zaman 0 fark. Accept rate değişse bile emitted text aynı (target greedy deterministik).
+### 1. Losslessness — Holds in Every Test
+`diff SD_output SSD_output` → always 0 difference. Even when accept rate changes, emitted text is identical (greedy target is deterministic).
 
-### 2. Accept Rate — B=7, K≤5'te Korunuyor
-draft-max=3 ve draft-max=5'te SSD B=7, accept rate'i değiştirmiyor (chain bütünlüğü intact). Tek istisna: primes prompt + draft-max=5'te hit=0 (cache miss, ama accept rate bozulmadı).
+### 2. Accept Rate — Preserved at B=7, K≤5
+At draft-max=3 and draft-max=5, SSD B=7 does not change accept rate (chain integrity intact). Single exception: primes + draft-max=5 hit=0 (cache miss, but accept rate unaffected).
 
-### 3. t/s Her Zaman Daha Düşük (Single GPU)
-Paper'ın kazancı draft'ın AYRI cihazda çalışmasını gerektiriyor (T_p < 1). Tek Metal GPU'da:
-- extra_decodes her zaman steps_saved'dan büyük
-- net_extra her zaman pozitif (+77 → +310 range)
-- t/s kaybı: %5–25 arası
+### 3. t/s Always Lower (Single GPU)
+Paper's gain requires draft running on a SEPARATE device (T_p < 1). On single Metal GPU:
+- extra_decodes always greater than steps_saved
+- net_extra always positive (+77 → +310 range)
+- t/s loss: 5–25%
 
-### 4. Hit Rate Pattern Paper Tahminiyle Uyumlu
+### 4. Hit Rate Pattern Matches Paper Prediction
 ```
 structured/predictable > creative/diverse
-primes (dm=3):  33–44% hit  ← en yüksek
+primes (dm=3):  33–44% hit  ← highest
 count (dm=3):   44% hit
 creative:       16–20% hit
 coding:         16–19% hit
 ```
-Paper Fig.3: rejection rate (= 1 - hit_rate) falls as power-law with fan-out → büyük B'de hit rate artar.
+Paper Fig.3: rejection rate (= 1 - hit_rate) falls as power-law with fan-out → larger B gives higher hit rate.
 
-### 5. B = K Durumu → Sıfır Overhead (Safe Fallback)
-`geometric_fanout(B, K)` B≤K → all-ones → alts sıfır. `ssd_fan_out > n_draft_max` koşulu False → cache lookup atlanır.
-draft-max=7, B=7: SD ile SSD neredeyse aynı (fark <1%). Güvenli fallback davranışı.
+### 5. B = K Case → Zero Overhead (Safe Fallback)
+`geometric_fanout(B, K)` with B≤K → all-ones → zero alts. `ssd_fan_out > n_draft_max` condition is False → cache lookup skipped.
+draft-max=7, B=7: SD and SSD nearly identical (difference <1%). Safe fallback behavior.
 
-### 6. draft-max=3 + B=7 → En Yüksek Hit Rate
-Kısa lookahead → bonus token çoğunlukla pozisyon 0-2'ye düşüyor → draft'ın top-F tahmini daha doğru. dm=3, count prompt: **44% hit** en iyi sonuç.
+### 6. draft-max=3 + B=7 → Highest Hit Rate
+Short lookahead → bonus token usually falls at positions 0-2 → draft's top-F prediction more accurate. dm=3, count prompt: **44% hit** — best result.
 
-### 7. draft-max=5, primes → 0 Hit Anomalisi
-Aynı prompt dm=3'te 33% hit, dm=5'te 0% hit. Sebep: daha derin lookahead ile bonus token genelde pozisyon 3-4'e düşüyor → draft'ın o pozisyonlardaki top-F tahminleri doğru değil (conditional on 5-step chain). Tesadüfî değil — deterministik, her run'da tekrarlanıyor.
+### 7. draft-max=5, primes → 0 Hit Anomaly
+Same prompt: 33% hit at dm=3, 0% hit at dm=5. Reason: deeper lookahead places bonus token at positions 3-4 → draft's top-F predictions at those positions are wrong (conditional on 5-step chain). Not random — deterministic, repeatable across runs.
 
 ---
 
-## Ne Zaman Kullanılır
+## When to Use
 
-| Durum | Öneri |
+| Situation | Recommendation |
 |---|---|
-| Single Mac, hız öncelik | `--ssd-fan-out 1` (SSD kapalı) |
-| Single Mac, hit rate ölçmek istiyorum | `--ssd-fan-out 7 --draft-max 3` |
-| Ayrı GPU/cihaz (gelecekte) | `--ssd-fan-out 20+` — gerçek kazanç burada başlıyor |
-| Structured/templated prompt | SSD daha yüksek hit rate → multi-device'da daha iyi |
-| Creative prompt | Hit rate ~20% → multi-device'da marginal kazanç |
+| Single Mac, speed priority | `--ssd-fan-out 1` (SSD off) |
+| Single Mac, want to measure hit rate | `--ssd-fan-out 7 --draft-max 3` |
+| Separate GPU/device (future) | `--ssd-fan-out 20+` — real gains start here |
+| Structured/templated prompt | SSD higher hit rate → better on multi-device |
+| Creative prompt | Hit rate ~20% → marginal gain on multi-device |
 
 ---
 
-## Bilinen Sınırlama: draft-max küçük iken creative prompt accept düşüşü
+## Known Limitation: Accept Rate Drop on Creative Prompts with Small draft-max
 
-dm=3, creative: SD=22.6% accept, SSD=21.7% accept — küçük düşüş. Çok sayıda round'da biriken K/V restore eksikliği. Primes dm=10+ durumundaki büyük düşüşün (82.5%→69.6%) küçük versiyonu.
+dm=3, creative: SD=22.6% accept, SSD=21.7% accept — small drop. Accumulated K/V restore gap over many rounds. Minor version of the large drop seen at primes dm=10+ (82.5%→69.6%).
 
-B=7 seçimi bu sınırlamayı minimize ediyor ama sıfırlamıyor.
+B=7 choice minimizes but doesn't eliminate this limitation.

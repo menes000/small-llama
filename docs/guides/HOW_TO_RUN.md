@@ -1,25 +1,25 @@
-# Nasıl Çalıştırılır — Hızlı Referans
+# How to Run — Quick Reference
 
-İki binary var:
-- `llama-spec` — tek prompt, batch çalıştırma (benchmark, test)
-- `llama-chat` — interaktif REPL (multi-turn chat, tools)
+Two binaries:
+- `llama-spec` — single prompt, batch execution (benchmark, test)
+- `llama-chat` — interactive REPL (multi-turn chat, tools)
 
-İkisi de aynı SSD/CPU-draft altyapısını kullanır.
+Both share the same SSD/CPU-draft infrastructure.
 
 ---
 
-## Modellerin Yeri
+## Model Paths
 
 ```
 /Users/enes/Desktop/all/llms/gemma-4-E4B-it-Q8_0.gguf              # target
 /Users/enes/Desktop/all/llms/gemma-4-E4B-it-assistant.Q8_0.gguf    # draft
 ```
 
-E2B çifti de var ama büyük target'larda CPU draft daha iyi sonuç verdiği için E4B kullan.
+E2B pair also exists, but CPU draft performs better with large targets — use E4B.
 
 ---
 
-## Build (gerekirse)
+## Build (if needed)
 
 ```bash
 cd /Users/enes/Desktop/all/less-llama-cpp/only-needed-files
@@ -28,9 +28,9 @@ cmake --build build --target llama-spec llama-chat
 
 ---
 
-## llama-chat (interaktif)
+## llama-chat (interactive)
 
-### En Hızlı Mod (Default — SD + CPU draft)
+### Fastest Mode (Default — SD + CPU draft)
 
 ```bash
 ./build/bin/llama-chat \
@@ -39,9 +39,9 @@ cmake --build build --target llama-spec llama-chat
   --no-tools
 ```
 
-**~73 t/s** primes prompt, E4B Q8 çiftinde. Hiç ekstra flag yok.
+**~73 t/s** on primes prompt with E4B Q8 pair. No extra flags needed.
 
-### SSD Aktif (paper algoritması, async overlap)
+### SSD Enabled (paper algorithm, async overlap)
 
 ```bash
 ./build/bin/llama-chat \
@@ -50,9 +50,9 @@ cmake --build build --target llama-spec llama-chat
   --no-tools --draft-max 5 --ssd-fan-out 7 --ssd-async
 ```
 
-**~70 t/s** + lossless. SSD overhead async overlap ile tamamen gizleniyor (hidden=%29).
+**~70 t/s** + lossless. SSD overhead fully hidden via async overlap (hidden=29%).
 
-### Tool'lar Aktif (read_file, list_dir)
+### Tools Enabled (read_file, list_dir)
 
 ```bash
 ./build/bin/llama-chat \
@@ -61,15 +61,15 @@ cmake --build build --target llama-spec llama-chat
   --root /Users/enes/Desktop/all --yolo
 ```
 
-`--yolo` = her tool çağrısını otomatik onayla. Çıkar `--yolo` interaktif onay için.
+`--yolo` = auto-confirm every tool call. Remove `--yolo` for interactive confirmation.
 
-### Eski Default (her ikisi GPU — SD Metal)
+### Legacy (both GPU — SD Metal)
 
 ```bash
 ./build/bin/llama-chat -m TARGET -md DRAFT --no-tools -ngl-draft 99
 ```
 
-E4B'de bu mod en yavaş. E2B çiftinde hâlâ en hızlı.
+Slowest mode for E4B. Still fastest for E2B pair.
 
 ---
 
@@ -84,7 +84,7 @@ E4B'de bu mod en yavaş. E2B çiftinde hâlâ en hızlı.
   -p "list the first 40 prime numbers" -n 150 --draft-max 5
 ```
 
-### SSD Aktif
+### SSD Enabled
 
 ```bash
 ./build/bin/llama-spec \
@@ -96,54 +96,54 @@ E4B'de bu mod en yavaş. E2B çiftinde hâlâ en hızlı.
 
 ---
 
-## Flag Referans
+## Flag Reference
 
-### Backend split (ikisinde de aynı)
-| Flag | Default | Açıklama |
+### Backend split (same for both binaries)
+| Flag | Default | Description |
 |---|---|---|
-| `-ngl N` | 99 | Target GPU layer sayısı (99 = full Metal) |
-| `-ngl-draft N` | **0** | Draft GPU layer sayısı (0 = CPU NEON) |
+| `-ngl N` | 99 | Target GPU layers (99 = full Metal) |
+| `-ngl-draft N` | **0** | Draft GPU layers (0 = CPU NEON) |
 
 ### SSD (paper 2603.03251v3)
-| Flag | Default | Açıklama |
+| Flag | Default | Description |
 |---|---|---|
-| `--ssd-fan-out B` | 1 | Toplam fan-out bütçesi (B≤K = kapalı; B>K aktif) |
-| `--ssd-r R` | 1.0 | Geometric fan-out üs (Thm 12) |
-| `--ssd-sampling-C C` | 1.0 | Saguaro sampling downweight (greedy mode'da etkisiz) |
-| `--ssd-async` | off | Target verify ile post-pass paralel |
+| `--ssd-fan-out B` | 1 | Total fan-out budget (B≤K = off; B>K = active) |
+| `--ssd-r R` | 1.0 | Geometric fan-out exponent (Thm 12) |
+| `--ssd-sampling-C C` | 1.0 | Saguaro sampling downweight (no effect in greedy mode) |
+| `--ssd-async` | off | Parallel SSD post-pass with target verify |
 
-### Genel
-| Flag | Default | Açıklama |
+### General
+| Flag | Default | Description |
 |---|---|---|
-| `--draft-max N` | spec=5, chat=3 | Round başına draft token sayısı (K) |
-| `-n N` | spec=128, chat=1024 | Max generation token |
+| `--draft-max N` | spec=5, chat=3 | Draft tokens per round (K) |
+| `-n N` | spec=128, chat=1024 | Max generation tokens |
 | `-c N` | 4096 | Context size |
-| `-p "..."` | "hello" (spec) | Tek prompt (sadece spec) |
+| `-p "..."` | "hello" (spec) | Single prompt (spec only) |
 
-### Chat'e özel
-| Flag | Default | Açıklama |
+### Chat-only
+| Flag | Default | Description |
 |---|---|---|
-| `--no-tools` | off | Tool'ları devre dışı bırak |
-| `--no-sd` | off | SD'yi devre dışı bırak (-md verilse bile) |
+| `--no-tools` | off | Disable tools |
+| `--no-sd` | off | Disable SD (even if -md provided) |
 | `--thinking` | off | Thinking mode |
 | `--kv-f16` | off | K/V cache f16 (default q8) |
-| `--root DIR` | $HOME | Tool sandbox kökü |
-| `--yolo` | off | Tool onaylarını atla |
+| `--root DIR` | $HOME | Tool sandbox root |
+| `--yolo` | off | Skip tool confirmations |
 
 ---
 
-## Hangi Mode Ne Kazandırır?
+## What Each Mode Gains
 
-| Senaryo | Komut eki | Beklenen kazanç |
+| Scenario | Extra flags | Expected gain |
 |---|---|---|
-| **Sadece hız** | (hiçbir şey) | E4B'de SD Metal'den %12 hızlı |
-| Paper SSD demo | `--ssd-fan-out 7 --ssd-async` | SD CPU ile eşit, lossless |
-| Hit rate ölçmek | `--ssd-fan-out 10 --ssd-async` | Hit %20-40, t/s biraz düşer |
-| Eski (her ikisi GPU) | `-ngl-draft 99` | E4B'de yavaş, E2B'de hızlı |
+| **Speed only** | (none) | SD CPU 12% faster than Metal on E4B |
+| Paper SSD demo | `--ssd-fan-out 7 --ssd-async` | Equal to SD CPU, lossless |
+| Measure hit rate | `--ssd-fan-out 10 --ssd-async` | Hit 20-40%, t/s slightly lower |
+| Legacy (both GPU) | `-ngl-draft 99` | Slow on E4B, fast on E2B |
 
 ---
 
-## Output Yorumlama
+## Reading the Output
 
 ### Spec stats:
 ```
@@ -158,38 +158,38 @@ E4B'de bu mod en yavaş. E2B çiftinde hâlâ en hızlı.
 [stats] SSD: hits=0 misses=5 hit=0.0% extra=41 saved=0 | verify=48ms post=79ms overlap=89ms hidden=29.3% async=on draft=CPU
 ```
 
-### Ana metrikler
-- `t/s` → ana hız (yüksek = iyi)
-- `acc_rate` → draft kalitesi (yüksek = iyi)
-- `hidden%` → async overlap ne kadar gizledi (yüksek = iyi)
-- `net_extra` → SSD'nin net maliyeti (düşük/negatif = iyi)
+### Key metrics
+- `t/s` → main speed (higher = better)
+- `acc_rate` → draft quality (higher = better)
+- `hidden%` → how much async overlap hid (higher = better)
+- `net_extra` → SSD net cost (lower/negative = better)
 
 ---
 
-## Lossless Doğrulama
+## Lossless Verification
 
-Her mode aynı output'u üretir (greedy target deterministik):
+Every mode produces identical output (greedy target is deterministic):
 
 ```bash
 TGT=/Users/enes/Desktop/all/llms/gemma-4-E4B-it-Q8_0.gguf
 DRF=/Users/enes/Desktop/all/llms/gemma-4-E4B-it-assistant.Q8_0.gguf
 P="list 30 primes"
 
-./build/bin/llama-spec -m $TGT -md $DRF -p "$P" -n 100                          > /tmp/sd.out
+./build/bin/llama-spec -m $TGT -md $DRF -p "$P" -n 100                              > /tmp/sd.out
 ./build/bin/llama-spec -m $TGT -md $DRF -p "$P" -n 100 --ssd-fan-out 7 --ssd-async > /tmp/ssd.out
-diff /tmp/sd.out /tmp/ssd.out  # boş olmalı
+diff /tmp/sd.out /tmp/ssd.out  # must be empty
 ```
 
 ---
 
-## Hızlı Tek-Tıklık Karşılaştırma
+## Quick One-Click Comparison
 
 ```bash
 TGT=/Users/enes/Desktop/all/llms/gemma-4-E4B-it-Q8_0.gguf
 DRF=/Users/enes/Desktop/all/llms/gemma-4-E4B-it-assistant.Q8_0.gguf
 P="list the first 40 prime numbers"
 
-echo "=== SD CPU draft (default, en hızlı) ==="
+echo "=== SD CPU draft (default, fastest) ==="
 ./build/bin/llama-spec -m $TGT -md $DRF -p "$P" -n 150 --draft-max 5 2>&1 \
   | grep -E "^\[spec\] (emitted|timing)"
 
@@ -206,11 +206,11 @@ printf "list the first 30 primes\n" | ./build/bin/llama-chat \
 
 ---
 
-## İlgili Diğer Dokümanlar
+## Related Docs
 
-- `SSD_REPORT.md` — Algoritma detay + bug fix history
+- `SSD_REPORT.md` — Algorithm detail + bug fix history
 - `SSD_COMPARISON.md` — E2B SD vs SSD sweep
-- `SSD_ASYNC_REPORT.md` — E2B async overlap analizi
-- `SSD_E4B_REPORT.md` — E4B Q8 çifti karşılaştırma + sürpriz CPU bulgular
-- `CHAT_SSD_REPORT.md` — Chat'e port detayı
-- `USAGE.md` — spec.cpp odaklı eski kılavuz
+- `SSD_ASYNC_REPORT.md` — E2B async overlap analysis
+- `SSD_E4B_REPORT.md` — E4B Q8 pair comparison + CPU draft discovery
+- `CHAT_SSD_REPORT.md` — Chat port details
+- `USAGE.md` — spec.cpp-focused reference

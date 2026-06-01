@@ -1,12 +1,12 @@
 # E2B Speculative Decoding Benchmark
 
-Tarih: 2026-05-26
-Model çifti:
+Date: 2026-05-26
+Model pair:
 - target: `/Users/enes/Desktop/all/llms/gemma-4-E2B-it-UD-Q8_K_XL.gguf`
 - draft:  `/Users/enes/Desktop/all/llms/gemma-4-E2B-it-assistant.F16.gguf`
 
-Ortam: Metal `-ngl 99`, `--temp 0` (greedy), `-n 300`, `-st`.
-Komut şablonu (baseline):
+Environment: Metal `-ngl 99`, `--temp 0` (greedy), `-n 300`, `-st`.
+Command template (baseline):
 ```bash
 ./build/bin/llama-cli -m <target> -p "<prompt>" -n 300 --temp 0 -st -ngl 99
 ```
@@ -17,14 +17,14 @@ Spec:
   -p "<prompt>" -n 300 --temp 0 -st -ngl 99
 ```
 
-Tüm spec çıktıları baseline ile **byte-byte aynı** (lossless garantisi).
+All spec outputs **byte-for-byte identical** to baseline (lossless guarantee).
 
 ---
 
-## Sonuç tablosu
+## Results Table
 
-| # | Prompt | baseline (t/s) | spec n=3 (t/s · acc% · acc/round) | spec n=5 (t/s · acc% · acc/round) | En iyi | Hızlanma |
-|---|--------|---------------:|----------------------------------:|----------------------------------:|:------:|---------:|
+| # | Prompt | baseline (t/s) | spec n=3 (t/s · acc% · acc/round) | spec n=5 (t/s · acc% · acc/round) | Best | Speedup |
+|---|--------|---------------:|----------------------------------:|----------------------------------:|:----:|--------:|
 | 1 | "hello" | 50.9 | 53.2 · 59.0% · 1.77 | **58.1** · 50.8% · 2.54 | n=5 | **1.14×** |
 | 2 | "What is 2+2? Answer in one word." | 50.6 | **52.6** · 56.5% · 1.70 | 51.0 · 42.0% · 2.10 | n=3 | 1.04× |
 | 3 | "Translate to French: The quick brown fox jumps over the lazy dog." | 50.5 | 48.9 · 50.4% · 1.51 | 45.5 · 35.4% · 1.77 | baseline | 0.97× |
@@ -34,65 +34,60 @@ Tüm spec çıktıları baseline ile **byte-byte aynı** (lossless garantisi).
 | 7 | "Write a Python function to compute the factorial of n." | 50.9 | **53.7** · 59.5% · 1.79 | 51.6 · 46.4% · 2.32 | n=3 | 1.05× |
 | 8 | "Write a short story about a robot learning to paint." | 50.4 | 41.5 · 39.4% · 1.18 | 35.9 · 27.8% · 1.39 | baseline | 0.82× |
 
-Baseline ortalaması: **50.4 t/s** (her prompt'ta neredeyse sabit).
+Baseline average: **50.4 t/s** (nearly constant across prompts).
 
 ---
 
-## Tipe göre özet
+## Summary by Type
 
-| Tip | Örnek | Hızlanma | Notu |
-|-----|-------|----------|------|
-| **Yapılı/şablonlu liste** | primes | **1.50×** | en yüksek acceptance (80%+), n=5 ideal |
-| Çok kısa / soru-cevap | hello, 2+2 | 1.04–1.14× | thinking template yapılı çıktı üretir |
-| Sıralı sayma | 1→100 | 1.05× | beklediğimden düşük (her sayı için ayrı argmax) |
-| Kod yazımı | python factorial | 1.05× | kod şablonlu ama açıklamalı → orta acc |
-| Çeviri (kısa) | French | 0.97× | breakeven civarı |
-| Açıklayıcı metin | transistor | 0.88× | yaratıcı → kayıp |
-| Yaratıcı düzyazı | robot hikayesi | 0.82× | en çeşitli → en büyük kayıp |
-
----
-
-## Gözlemler
-
-### 1. avg_accepted/round n_max'i geçemiyor
-n=5'te bile çoğu prompt 2-3'te doyuyor → daha büyük n_max boşa overhead. Sadece
-yapısal görevde (primes 3.60) yüksek n_max ödüllendi.
-
-### 2. acceptance ≠ hızlanma değil, **acc/round** belirleyici
-n=5 acc% her zaman n=3'ten düşük (matematik gereği — daha fazla token daha sık reddedilir),
-ama gerçek metrik `accepted/round`. n=5 primes'da 3.60 → büyük kazanç.
-
-### 3. Sweet-spot n_max heuristic
-- avg_accepted/round n_max'a yaklaşıyor → **n_max'i artır** (daha kazanılacak)
-- avg_accepted/round ≤ n_max/2 → **n_max'i düşür** (boşa draft)
-- avg_accepted/round < 1.3 → spec **muhtemelen kaybediyor**, baseline kullan
-
-### 4. Thinking template etkisi
-Gemma-4-it gguf'unun chat template'i thinking modunu açıyor (`<|channel>thought`, "Thinking
-Process:"). Kısa prompt'larda bile uzun thinking bloğu üretiyor — bu yapılı kısım
-acceptance'ı yukarı çekiyor (hello %59, 2+2 %57). Yaratıcı son cevap düşük acceptance.
-
-### 5. Loss patterns (neden kayıp)
-- "Write a short story" %39 acc, 1.18 acc/round, 0.82× hız
-- 1 token/round ortalamada bile round başına sabit overhead (graph rebuild + N draft +
-  verify + tap copy + cluster mask) baseline'dan 1-1.5× pahalı → net kayıp
-- Bu **lossless korunarak** olur — çıktı doğru, sadece daha yavaş
+| Type | Example | Speedup | Note |
+|------|---------|---------|------|
+| **Structured/templated list** | primes | **1.50×** | highest acceptance (80%+), n=5 ideal |
+| Very short / Q&A | hello, 2+2 | 1.04–1.14× | thinking template produces structured output |
+| Sequential counting | 1→100 | 1.05× | lower than expected (separate argmax per number) |
+| Code generation | python factorial | 1.05× | structured but with explanation → medium acc |
+| Short translation | French | 0.97× | near breakeven |
+| Explanatory text | transistor | 0.88× | creative → loss |
+| Creative prose | robot story | 0.82× | most diverse → largest loss |
 
 ---
 
-## Öneri kullanım
+## Observations
 
-| Görev | Komut |
-|-------|-------|
-| Yapısal liste / tablo / format | `--spec-draft-n-max 5` veya `6` |
-| Kısa Q&A / kod / çeviri | `--spec-draft-n-max 3` |
-| Uzun yaratıcı metin | baseline (spec kaybeder) veya `--spec-draft-n-max 2` |
+### 1. avg_accepted/round can't exceed n_max
+Even at n=5, most prompts saturate at 2-3 → higher n_max wastes overhead. Only structured tasks (primes 3.60) rewarded by larger n_max.
 
-İlk çalıştırmada acceptance'a bak (`G4A STATS:` stderr'de), n_max'i ayarla.
+### 2. acceptance ≠ speedup — **acc/round** is the real metric
+n=5 acc% always lower than n=3 (math: more tokens → more rejections), but the actual metric is `accepted/round`. n=5 primes gives 3.60 → large gain.
+
+### 3. n_max sweet-spot heuristic
+- avg_accepted/round approaching n_max → **increase n_max** (more to gain)
+- avg_accepted/round ≤ n_max/2 → **decrease n_max** (wasted draft)
+- avg_accepted/round < 1.3 → spec **likely losing**, use baseline
+
+### 4. Thinking template effect
+Gemma-4-it gguf chat template enables thinking mode (`<|channel>thought`, "Thinking Process:"). Even short prompts generate long thinking blocks — these structured sections boost acceptance (hello 59%, 2+2 57%). Creative final answer has low acceptance.
+
+### 5. Loss patterns (why losses happen)
+- "Write a short story" 39% acc, 1.18 acc/round, 0.82× speed
+- Even at 1 token/round average, per-round fixed overhead (graph rebuild + N draft + verify + tap copy + cluster mask) costs more than 1 baseline token → net loss
+- This happens **while preserving losslessness** — output correct, just slower
 
 ---
 
-## Ham komutlar (yeniden üretmek için)
+## Recommended Usage
+
+| Task | Command |
+|------|---------|
+| Structured list / table / format | `--spec-draft-n-max 5` or `6` |
+| Short Q&A / code / translation | `--spec-draft-n-max 3` |
+| Long creative text | baseline (spec loses) or `--spec-draft-n-max 2` |
+
+Check acceptance on first run (`G4A STATS:` in stderr), tune n_max accordingly.
+
+---
+
+## Raw Commands (to reproduce)
 
 ```bash
 cd /Users/enes/Desktop/all/less-llama-cpp/llama.cpp

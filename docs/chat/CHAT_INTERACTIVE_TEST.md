@@ -6,7 +6,7 @@ Real-world llama-chat session comparison on Gemma4 E4B Q8 target with assistant 
 
 - **Target**: `gemma-4-E4B-it-Q8_0.gguf` (8 GB Q8)
 - **Draft**: `gemma-4-E4B-it-assistant.Q8_0.gguf` (96 MB Q8)
-- **Donanım**: M2 Pro
+- **Hardware**: M2 Pro
 - **Mode**: `-n 200 --no-tools` (multi-turn interactive)
 
 ## Results
