@@ -896,7 +896,7 @@ int main(int argc, char ** argv) {
             // Recompute the correct KV depth from the actual emitted text and fix both cases.
             if (tool_seen) {
                 const std::string lf   = formatted + assistant_text;
-                const auto lf_toks     = tokenize(vocab, lf, /*add_special=*/true);
+                const auto lf_toks     = tokenize(vocab, lf, /*add_special=*/false);
                 const int64_t want_kv  = (int64_t) lf_toks.size();
                 if (kv_pos > want_kv) {
                     // Ghost tokens: trim target KV and acc vectors
